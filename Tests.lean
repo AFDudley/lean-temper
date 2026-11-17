@@ -15,6 +15,7 @@
 import Lean
 import DefToStructure.Patterns
 import DefToStructure.Discovery
+import DefToStructure.Alias
 
 open Lean DefToStructure
 
@@ -390,6 +391,89 @@ def silentCase (env : Environment) : IO Bool := do
   IO.println "ok   silent constructor"
   return true
 
+/-! ## The alias transform (`DefToStructure.Alias`)
+
+Each case elaborates a whole snippet (with `Init` only), computes the
+declaration edits and the call-site edits of one form from the info tree,
+compares the text, and elaborates the result: it must have no error. -/
+
+/-- The proof form of a case. -/
+inductive ProofForm where
+  | unchanged | substituted | generalized
+
+structure AliasCase where
+  name : String
+  src : String
+  decl : Name
+  binders : Array String
+  proof : ProofForm
+  want : String
+
+def fooSrc (use : String) : String :=
+  s!"theorem foo \{n : Nat} (m : Nat) (hn : n = m + 1) : 0 < n := by\n  subst hn\n  exact Nat.succ_pos m\n\n{use}"
+
+def bazSrc (use : String) : String :=
+  s!"theorem baz (a : Nat) (b : Nat) (hb : b = a + 1) (h : 0 < b) : b ≠ 0 := by\n  subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\n{use}"
+
+def aliasCases : List AliasCase := [
+  { name := "implicit binder at the call site; the proof names hv (`subst hn` goes)",
+    src := fooSrc "theorem use1 : 0 < 3 := foo 2 rfl\n", decl := `foo, binders := #["n"], proof := .substituted,
+    want := "theorem foo (m : Nat) : 0 < (m + 1) := by\n  exact Nat.succ_pos m\n\ntheorem use1 : 0 < 3 := foo 2\n" },
+  { name := "named argument",
+    src := fooSrc "theorem use2 : 0 < 3 := foo (hn := rfl) 2\n", decl := `foo, binders := #["n"], proof := .substituted,
+    want := "theorem foo (m : Nat) : 0 < (m + 1) := by\n  exact Nat.succ_pos m\n\ntheorem use2 : 0 < 3 := foo 2\n" },
+  { name := "dot notation; the proof does not name v or hv",
+    src := "structure P where\n  x : Nat\n\ntheorem P.le (p : P) (k : Nat) (hk : k = p.x) : k ≤ p.x + 1 := by\n  omega\n\ntheorem use3 (p : P) : p.x ≤ p.x + 1 := p.le p.x rfl\n",
+    decl := `P.le, binders := #["k"], proof := .unchanged,
+    want := "structure P where\n  x : Nat\n\ntheorem P.le (p : P) : p.x ≤ p.x + 1 := by\n  omega\n\ntheorem use3 (p : P) : p.x ≤ p.x + 1 := p.le\n" },
+  { name := "the proof names v and hv; a hypothesis names v",
+    src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
+    proof := .substituted,
+    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
+  { name := "the proof kept behind `generalize … at h ⊢`",
+    src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
+    proof := .generalized,
+    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  generalize hb : (a + 1) = b at h ⊢; replace hb := hb.symm; subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
+  { name := "a caller with its own variable for v: the call gets a cast",
+    src := bazSrc "theorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := baz 2 k hk h\n", decl := `baz,
+    binders := #["b"], proof := .substituted,
+    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := (by obtain rfl := hk; exact (baz 2 h))\n" } ]
+
+def runAliasCase (c : AliasCase) : IO Bool := do
+  let fe ← Alias.elabText "t.lean" `t c.src
+  unless fe.errors.isEmpty do
+    IO.println s!"FAIL {c.name}: the snippet has errors: {fe.errors}"
+    return false
+  let fs := c.binders.map fun b => { declaration := c.decl.toString, binder := b, rhs := "", at_ := "t.lean:1" }
+  match Alias.declEdits fe c.decl fs with
+  | .error msg =>
+    IO.println s!"FAIL {c.name}: {msg}"
+    return false
+  | .ok de =>
+    let skip := ((Alias.declCommand? fe c.decl).bind Alias.rng?).getD (0, 0)
+    let sites ← Alias.callSites fe c.decl (de.pairs.map fun p => (p.v, p.hv)) skip
+    if let some p := sites.problem then
+      IO.println s!"FAIL {c.name}: {p}"
+      return false
+    let proof ← match c.proof, de.proof with
+      | .unchanged, _ => pure #[]
+      | .generalized, _ => pure de.preamble.toArray
+      | .substituted, .ok eds => pure eds
+      | .substituted, .error msg => do
+        IO.println s!"FAIL {c.name}: {msg}"
+        return false
+    let edits := de.sig ++ proof ++ sites.edits
+    let got := applyEdits c.src edits
+    unless got == c.want do
+      IO.println s!"FAIL {c.name}:\n--- got\n{got}--- want\n{c.want}"
+      return false
+    let after ← Alias.elabText "t.lean" `t got
+    unless after.errors.isEmpty do
+      IO.println s!"FAIL {c.name}: the result has errors: {after.errors}"
+      return false
+    IO.println s!"ok   {c.name}"
+    return true
+
 end Tests
 
 open Tests in
@@ -403,5 +487,8 @@ unsafe def main (args : List String) : IO UInt32 := do
     unless ← runCase env c do failed := failed + 1
   total := total + 1
   unless ← silentCase env do failed := failed + 1
+  for c in aliasCases do
+    total := total + 1
+    unless ← runAliasCase c do failed := failed + 1
   IO.println s!"{total - failed}/{total} passed"
   return if failed == 0 then 0 else 1

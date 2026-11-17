@@ -26,8 +26,71 @@ worktree, never a live branch. Every `lake` command runs as
 `~/.elan/bin` on `PATH` and `CI` unset. Logs, `state.json` and the LSP log
 go to `<checkout>/.scratch/codemod/`.
 
-Tests: `lake env <checkout> .lake/build/bin/tests <checkout>` (the snippets
-parse with `Init` and `Mathlib.Tactic.Says` from the checkout).
+Tests: `.lake/build/bin/tests <checkout>` (the snippets parse with `Init`
+and `Mathlib.Tactic.Says` from the checkout; the alias cases elaborate with
+`Init`).
+
+## Alias mode
+
+```
+.lake/build/bin/def_to_structure --checkout /path/to/armada-lean-worktree \
+  --slot 3 --alias WORKLIST.json --report scripts/codemod/alias-report.json
+```
+
+The work list holds `aliasHypothesis` findings of `scripts/type_lint.lean`
+(`declaration`, `binder` v, `rhs`, `at`). For each declaration the mode
+deletes the binders `v` and `hv : v = rhs` (or `rhs = v`), puts the
+source text of `rhs` for `v` in the signature, and deletes the two
+arguments at every call site. Code: `DefToStructure/Alias.lean`; driver:
+`stepAlias` in `Main.lean`.
+
+Every fact comes from the info tree of an in-process elaboration of the
+current file text (`Alias.elabText`, `Elab.async` off), not from the text:
+
+| fact | source |
+|------|--------|
+| the free variables of `v` and `hv` | the binder term nodes at the binder identifiers |
+| `hv`'s equation and the side that is `rhs` | the `=` binder whose one side is an identifier node that elaborated to `v` |
+| the occurrences of `v` and `hv` in the signature and in the proof | term nodes whose expression is that free variable (`c` in `c.participants` has its own node); binders in the proof that reuse the name are other variables |
+| a call site | a term node of `app` syntax whose expression is an application of `D` |
+| the argument for `v` or `hv` | a named argument `(v := e)`; else the syntactic argument whose own term node elaborated to the application's argument at that binder's index. An implicit argument has no syntax; the receiver of dot notation is no syntactic argument |
+| a caller's own term for `v` | the two sides of `hv`'s type, instantiated with the call's arguments, are not definitionally equal (`isDefEq` in the call's context) |
+| a caller's own variable for `v` | that, and the application's argument at `v`'s index is a free variable |
+| a binder that a tactic reintroduced (`induction`, `cases`) | a free variable with the user name of `v` or `hv` and no binder node in the declaration |
+
+Proof forms, tried in this order for each declaration (the first without an
+error stays):
+
+| proof form | edit |
+|------------|------|
+| unchanged | the proof does not name `v` or `hv` |
+| substituted | `v` becomes `rhs`; a `rw` rule or a `simp` lemma that names `hv` goes (the whole `rw` when it was its only rule); `subst` and `clear` of `v` or `hv`, and `cases hv`, `rcases hv`, `induction hv`, `obtain … := hv` go; `hv ▸ e` becomes `e`; another `hv` becomes `rfl` |
+| behind `generalize` | the first tactic gets `generalize hv : rhs = v at h₁ … ⊢; replace hv := hv.symm;` (`replace` only for `v = rhs`; `h₁ …` are the binders whose types named `v`); a term proof becomes `by <that>exact <term>`. `generalize` also abstracts the occurrences of `rhs` that the statement had itself |
+
+A call site loses the two arguments. When the caller passes its own term
+for `v` (see the table above), the call also gets a cast with the `hv`
+argument `h`: `(by obtain rfl := h; exact (D …))` for a local variable, else
+`(h ▸ D …)`.
+
+Loop (`stepAlias`): one declaration at a time, the last declaration of the
+last file first. A caller then comes before its callee, so the caller's
+arguments are already `rhs`, not its own variable. For each declaration:
+the analysis of its file and of every file that names it, on their current
+texts; then each proof form, its files written and checked in import order
+through `lake serve`. An error outside the declaration's own command is at
+a call site, and ends the declaration's forms. A module is rebuilt
+(`lake build <Module>`) before a file that imports it is elaborated or
+checked. With no form left, the files go back to their texts before the
+declaration. A second pass retries each declaration that failed on a form.
+The end is the full check of the def mode, without
+`scripts/update_gate_baseline.py` (the mode changes nothing under
+`scripts/` outside `scripts/codemod/`), and `check.sh --json --base <head>`.
+The report's `alias` field lists each finding: `fixed`, `form`, `reason`
+(the last form's first error), `attempts` (every form and its first error),
+`files_changed`.
+
+Not handled (reported as not fixed): `v` or `hv` bound in the statement
+(`∀ n, n = W.length → …`): the proof's `intro`s depend on them.
 
 ## Files
 
@@ -53,9 +116,13 @@ parse with `Init` and `Mathlib.Tactic.Says` from the checkout).
 - `DefToStructure/Discovery.lean`: `findDeclarationRanges?`, the `def`
   pieces from the parsed declaration, the conversion text, the import graph
   from file headers.
+- `DefToStructure/Alias.lean`: the alias mode: the in-process elaboration,
+  the declaration edits and the call-site edits from the info tree.
 - `Tests.lean`: 55 cases of the decision (the 43 recorded cases of the first
   tool, the silent projection, the parenthesized-receiver goal, the two
-  applications under `unfold`, the negation cases and the `Decidable` instances).
+  applications under `unfold`, the negation cases and the `Decidable` instances),
+  and 6 alias cases (an implicit argument, a named argument, dot notation,
+  a proof that names `v` and `hv`, the `generalize` form, a call with a cast).
 - `scope.lean`: scope measurement, `lake env lean scope.lean` in a built
   checkout.
 

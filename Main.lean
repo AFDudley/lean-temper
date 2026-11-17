@@ -28,6 +28,7 @@ import DefToStructure.Lsp
 import DefToStructure.Parse
 import DefToStructure.Patterns
 import DefToStructure.Discovery
+import DefToStructure.Alias
 
 open Lean DefToStructure DefToStructure.Discovery
 
@@ -39,6 +40,8 @@ structure Args where
   names : Array String
   report : System.FilePath
   resume : Bool
+  /-- `--alias WORKLIST.json`: the alias transform (`DefToStructure.Alias`). -/
+  alias : Option System.FilePath := none
 
 def parseArgs (args : List String) : Except String Args := do
   let mut checkout := ""
@@ -46,6 +49,7 @@ def parseArgs (args : List String) : Except String Args := do
   let mut names := ""
   let mut report := ""
   let mut resume := false
+  let mut alias := ""
   let mut rest := args
   while !rest.isEmpty do
     match rest with
@@ -54,12 +58,13 @@ def parseArgs (args : List String) : Except String Args := do
     | "--names" :: v :: r => names := v; rest := r
     | "--report" :: v :: r => report := v; rest := r
     | "--resume" :: r => resume := true; rest := r
+    | "--alias" :: v :: r => alias := v; rest := r
     | a :: _ => throw s!"unknown argument {a}"
     | [] => pure ()
-  if checkout.isEmpty || slot == 0 || names.isEmpty || report.isEmpty then
-    throw "usage: def_to_structure --checkout DIR --slot N --names A,B --report FILE [--resume]"
+  if checkout.isEmpty || slot == 0 || (names.isEmpty && alias.isEmpty) || report.isEmpty || (resume && !alias.isEmpty) then
+    throw "usage: def_to_structure --checkout DIR --slot N (--names A,B [--resume] | --alias WORKLIST.json) --report FILE"
   return { checkout, slot, names := (names.splitOn ",").map (·.trimAscii.copy) |>.filter (· ≠ "") |>.toArray,
-           report, resume }
+           report, resume, alias := if alias.isEmpty then none else some alias }
 
 /-- A stop: the tool changes nothing more and reports `msg`. -/
 structure StopError where
@@ -116,6 +121,8 @@ structure Env where
   state : IO.Ref State
   lintBeforeFindings : IO.Ref (Array String)
   seen : IO.Ref (Std.HashSet String)
+  /-- The alias mode's per-finding results (`stepAlias`). -/
+  aliasReport : IO.Ref Json
 
 abbrev M := ReaderT Env (ExceptT StopError IO)
 
@@ -456,15 +463,229 @@ def stepFiles (env : Environment) : M Unit := do
   | .ok () => pure ()
   | .error err => throw err
 
+-- --- the alias mode -------------------------------------------------------------
+
+/-- One declaration of the alias work list and its result. -/
+structure AliasUnit where
+  decl : Name
+  file : String
+  line : Nat
+  findings : Array Alias.Finding
+  /-- The accepted form: the proof form and the call-site form. -/
+  form : Option String := none
+  files : Array String := #[]
+  /-- Each tried form and the first error that it gave. -/
+  attempts : Array (String × String) := #[]
+  deriving Inhabited
+
+def AliasUnit.short (u : AliasUnit) : String := (u.decl.toString.splitOn ".").getLast!
+
+def aliasResults (units : Array AliasUnit) : Json :=
+  Json.arr <| units.flatMap fun u => u.findings.map fun f =>
+    Json.mkObj [("declaration", toJson f.declaration), ("binder", toJson f.binder), ("rhs", toJson f.rhs),
+      ("at", toJson f.at_), ("fixed", toJson u.form.isSome), ("form", toJson u.form),
+      ("reason", toJson (if u.form.isSome then "" else (u.attempts.back?.map (·.2)).getD "not tried")),
+      ("attempts", Json.arr (u.attempts.map fun (f, m) => Json.mkObj [("form", toJson f), ("error", toJson m)])),
+      ("files_changed", toJson u.files)]
+
+/-- Build every module among `files[0:upto]` whose text on disk is not the
+    text of its last build. -/
+def buildUpTo (files : Array String) (upto : Nat) (disk built : Std.HashMap String String) :
+    M (Std.HashMap String String) := do
+  let mut built := built
+  for k in [0:upto] do
+    let rel := files[k]!
+    unless rel.startsWith "ArmadaLean" do continue
+    let t := disk.getD rel ""
+    if built.get? rel != some t then
+      let m := moduleName rel
+      let p ← runCmd #["lake", "build", m.toString] s!"build-{m}.log"
+      if p.exitCode != 0 then stop s!"lake build {m} failed:\n{(tail (p.stdout ++ p.stderr) 3000)}"
+      built := built.insert rel t
+  return built
+
+/-- The server's errors for `rel` with `text`: the message and its byte offset. -/
+def serverErrors (c : Lsp.Client) (rel text : String) : M (Array (String × Nat)) := do
+  let uri := Lsp.uriOf (← read).root rel
+  c.open uri text
+  let diags ← c.waitIdle uri
+  c.close uri
+  let fm := FileMap.ofString text
+  return diags.filterMap fun d =>
+    if d.severity? == some .error then
+      some (s!"{rel}:{d.range.start.line + 1}:{d.range.start.character}: {d.message}",
+        (fm.lspPosToUtf8Pos d.range.start).byteIdx)
+    else none
+
+/-- The alias mode (`--alias`), one declaration at a time, the last
+    declaration of the last file first (a caller before its callee: the
+    caller's arguments are then the right-hand side, not its own variable).
+    For each declaration: an in-process elaboration of its file and of every
+    file that names it, on their current texts (`Alias.declEdits`,
+    `Alias.callSites`); then each form in turn, its files checked in import
+    order through `lake serve` (an edited module is rebuilt before a file
+    that imports it). The first form without an error stays; with none, the
+    files go back to their texts before the declaration. -/
+def stepAlias : M Unit := do
+  let e ← read
+  let some wl := e.args.alias | stop "--alias: no work list"
+  let findings ← match Json.parse (← IO.FS.readFile wl) >>= fun j => do (← j.getArr?).mapM Alias.Finding.ofJson with
+    | .ok fs => pure fs
+    | .error err => stop s!"the work list is not valid: {err}"
+  let mut units : Array AliasUnit := #[]
+  for f in findings do
+    match units.findIdx? (·.decl.toString == f.declaration) with
+    | some i => units := units.modify i fun u => { u with findings := u.findings.push f }
+    | none =>
+      let line := ((f.at_.splitOn ":")[1]?.bind String.toNat?).getD 0
+      units := units.push { decl := f.declaration.toName, file := f.file, line, findings := #[f] }
+  -- the files: each declaration's file and every file that names it, in import order
+  let cands ← candidates e.root
+  let mut mentioned : Std.HashSet String := {}
+  for u in units do
+    mentioned := mentioned.insert u.file
+    let g ← git #["grep", "-lw", u.short, "--", "ArmadaLean.lean", "ArmadaLean", "docs/counterexamples"]
+    for l in g.stdout.splitOn "\n" do
+      if l ≠ "" then mentioned := mentioned.insert l
+  let files := (dependents cands (units.map fun u => moduleName u.file)).filter mentioned.contains
+  let fileIdx (rel : String) : Nat := (files.idxOf? rel).getD files.size
+  let order := (Array.range units.size).qsort fun a b =>
+    let (ua, ub) := (units[a]!, units[b]!)
+    fileIdx ua.file > fileIdx ub.file || (ua.file == ub.file && ua.line > ub.line)
+  log s!"[alias] {units.size} declarations, {files.size} files"
+  let home := (← IO.getEnv "HOME").getD ""
+  initSearchPath (← findSysroot s!"{home}/.elan/bin/lean") (← targetSearchPath e.root)
+  let mut disk : Std.HashMap String String := {}
+  for rel in files do disk := disk.insert rel (← IO.FS.readFile (e.root / rel))
+  let c ← Lsp.start e.root (e.logDir / "lsp.log")
+  let result ← tryCatch (do
+    let mut units := units
+    let mut disk := disk
+    let mut built := disk
+    -- a second pass retries each declaration that failed on a form: the
+    -- declarations accepted after it can change its callers and callees
+    for (ui, k) in (order ++ order).zipIdx do
+      let u := units[ui]!
+      if k ≥ order.size && (u.form.isSome || u.attempts.any (·.1 == "analysis")) then continue
+      log s!"[alias] {u.decl}{if k ≥ order.size then " (second pass)" else ""}"
+      let uFiles := files.filter fun rel => rel == u.file || ((disk.getD rel "").splitOn u.short).length > 1
+      -- analysis on the current texts
+      built ← buildUpTo files (fileIdx u.file) disk built
+      let elabFile (rel : String) : M Alias.FileElab := do
+        let t0 ← IO.monoMsNow
+        let fe ← Alias.elabText (e.root / rel).toString (moduleName rel) (disk.getD rel "")
+        log s!"[alias]   elaborated {rel} in {((← IO.monoMsNow) - t0) / 1000}s"
+        unless fe.errors.isEmpty do stop s!"{rel} has errors before the edit: {fe.errors[0]!}"
+        return fe
+      let fe ← elabFile u.file
+      let de ← match Alias.declEdits fe u.decl u.findings with
+        | .ok de => pure de
+        | .error msg =>
+          units := units.set! ui { u with attempts := #[("analysis", msg)] }
+          e.aliasReport.set (aliasResults units)
+          continue
+      let skip := ((Alias.declCommand? fe u.decl).bind Alias.rng?).getD (0, 0)
+      let pairs := de.pairs.map fun p => (p.v, p.hv)
+      let mut sites : Array (String × Alias.Sites) := #[]
+      let mut problem : Option String := none
+      for rel in uFiles do
+        let fe' ← if rel == u.file then pure fe else do
+          built ← buildUpTo files (fileIdx rel) disk built
+          elabFile rel
+        unless fe'.env.contains u.decl do continue
+        let s ← Alias.callSites fe' u.decl pairs (if rel == u.file then skip else (0, 0))
+        if let some pr := s.problem then problem := some s!"{rel}:{pr}"
+        if !s.edits.isEmpty && (rel.startsWith "ArmadaLean/Spec/" || rel.startsWith "ArmadaLean/Lint/") then
+          problem := some s!"{rel}: a call site is under ArmadaLean/Spec/ or ArmadaLean/Lint/"
+        sites := sites.push (rel, s)
+      if let some pr := problem then
+        units := units.set! ui { u with attempts := #[("analysis", pr)] }
+        e.aliasReport.set (aliasResults units)
+        continue
+      -- the proof forms, in order
+      let mut attempts : Array (String × String) := u.attempts
+      let mut proofForms : Array (String × Array Edit) := #[]
+      if !de.proofNames then proofForms := proofForms.push ("proof unchanged", #[])
+      else match de.proof with
+        | .ok eds => proofForms := proofForms.push ("proof substituted", eds)
+        | .error msg => attempts := attempts.push ("proof substituted", msg)
+      if let some p := de.preamble then proofForms := proofForms.push ("proof behind generalize", #[p])
+      let mut accepted : Option (String × Array String) := none
+      for (form, peds) in proofForms do
+        -- the texts of this form
+        let mut texts : Array (String × String × Array Edit) := #[]
+        let mut bad : Option String := none
+        for rel in uFiles do
+          let call := ((sites.find? (·.1 == rel)).map (·.2.edits)).getD #[]
+          let own := if rel == u.file then de.sig ++ peds else #[]
+          match Alias.nest (call ++ own) with
+          | .ok eds => texts := texts.push (rel, applyEdits (disk.getD rel "") eds, eds)
+          | .error msg => bad := some s!"{rel}: {msg}"
+        if let some msg := bad then
+          attempts := attempts.push (form, msg)
+          continue
+        -- the check, file by file
+        let before := disk
+        let mut failure : Option (String × Array (String × Nat) × Array Edit) := none
+        for (rel, text, eds) in texts do
+          if text != disk.getD rel "" then
+            checkForbidden (disk.getD rel "") text rel
+            writeFile rel text
+            disk := disk.insert rel text
+          built ← buildUpTo files (fileIdx rel) disk built
+          log s!"[alias]   checking {rel} ({form})"
+          let errs ← serverErrors c rel text
+          unless errs.isEmpty do
+            failure := some (rel, errs, eds)
+            break
+        match failure with
+        | none =>
+          accepted := some (form, (texts.filter fun (rel, t, _) => t != before.getD rel "").map (·.1))
+          break
+        | some (rel, errs, eds) =>
+          log s!"[alias]   {form}: {errs[0]!.1.take 300}"
+          for (rel, _, _) in texts do
+            let t := before.getD rel ""
+            if disk.getD rel "" != t then
+              writeFile rel t
+              disk := disk.insert rel t
+          -- an error outside the declaration's own command is at a call
+          -- site: no proof form changes it
+          let shift (o : Nat) : Nat := eds.foldl (init := o) fun acc ed =>
+            if ed.stop ≤ o then acc + ed.replacement.utf8ByteSize - (ed.stop - ed.start) else acc
+          let inDecl (o : Nat) : Bool := rel == u.file && shift skip.1 ≤ o && o ≤ shift skip.2
+          match errs.find? (!inDecl ·.2) with
+          | some (m, _) =>
+            attempts := attempts.push (form, s!"at a call site: {m}")
+            break
+          | none => attempts := attempts.push (form, errs[0]!.1)
+      match accepted with
+      | some (form, fs) =>
+        log s!"[alias]   fixed: {form}"
+        units := units.set! ui { u with form := some form, files := fs, attempts }
+      | none => units := units.set! ui { u with attempts }
+      e.aliasReport.set (aliasResults units)
+    pure (Except.ok ()))
+    (fun err => pure (Except.error err))
+  c.stop
+  match result with
+  | .ok () => pure ()
+  | .error err => throw err
+
 def stepAfter : M Unit := do
   let e ← read
   let (ok, out) ← fullBuild "after"
   unless ok do stop ("the repaired tree does not build:\n" ++ (tail out 3000))
   let (findings, summary) ← typeLint "after"
-  let pyArgs : IO.Process.SpawnArgs :=
-    { cmd := "python3", args := #["scripts/update_gate_baseline.py", "--hashes-only"], cwd := e.root }
-  let p ← IO.Process.output pyArgs
-  let chk ← runCmd #["bash", "scripts/check.sh", "--json"] "check.log"
+  -- the alias mode changes nothing under `scripts/` outside `scripts/codemod/`
+  let hashes ← if e.args.alias.isSome then pure Json.null else
+    let pyArgs : IO.Process.SpawnArgs :=
+      { cmd := "python3", args := #["scripts/update_gate_baseline.py", "--hashes-only"], cwd := e.root }
+    let p ← IO.Process.output pyArgs
+    pure (Json.mkObj [("exit", toJson p.exitCode.toNat), ("stderr", toJson (tail p.stderr 1000))])
+  let head := (← e.state.get).head
+  let base := if e.args.alias.isSome then #["--base", head] else #[]
+  let chk ← runCmd (#["bash", "scripts/check.sh", "--json"] ++ base) "check.log"
   let checkJson := match (chk.stdout.trimAscii.copy.splitOn "\n").getLast? >>= fun l => (Json.parse l).toOption with
     | some j => j
     | none => Json.mkObj [("error", toJson ((tail chk.stdout 2000) ++ (tail chk.stderr 2000)))]
@@ -484,9 +705,10 @@ def stepAfter : M Unit := do
     ("predicates", toJson s.predReports), ("repairs", toJson s.repairs), ("rounds", Json.arr s.rounds),
     ("lint_before", s.lintBefore), ("lint_after", summary),
     ("findings_removed", toJson removed), ("findings_added", toJson added),
-    ("gate_baseline_hashes", Json.mkObj [("exit", toJson p.exitCode.toNat), ("stderr", toJson (tail p.stderr 1000))]),
+    ("gate_baseline_hashes", hashes),
     ("check", okFields), ("check_full", checkJson),
     ("files_changed", toJson ((← git #["status", "--porcelain"]).stdout.splitOn "\n" |>.filter (· ≠ "") |>.map (·.drop 3 |>.copy))),
+    ("alias", ← e.aliasReport.get),
     ("timings", toJson s.timings)]
   IO.FS.writeFile e.args.report (report.pretty ++ "\n")
 
@@ -500,11 +722,17 @@ def writeStopReport (msg : String) : M Unit := do
     ("stopped", toJson msg), ("stops", toJson s.stops), ("predicates", toJson s.predReports),
     ("repairs", toJson s.repairs), ("rounds", Json.arr s.rounds), ("lint_before", s.lintBefore),
     ("files_changed", toJson ((← git #["status", "--porcelain"]).stdout.splitOn "\n" |>.filter (· ≠ "") |>.map (·.drop 3 |>.copy))),
+    ("alias", ← e.aliasReport.get),
     ("timings", toJson s.timings)]
   IO.FS.writeFile e.args.report (report.pretty ++ "\n")
 
 def run : M Unit := do
   let e ← read
+  if e.args.alias.isSome then
+    stepBefore
+    stepAlias
+    stepAfter
+    return
   if !e.args.resume then
     stepBefore
   let cands ← candidates e.root
@@ -548,7 +776,9 @@ unsafe def main (argv : List String) : IO UInt32 := do
   let stateRef ← IO.mkRef state
   let lintRef ← IO.mkRef lintBefore
   let seenRef ← IO.mkRef ({} : Std.HashSet String)
-  let env : Env := { args, root, logDir, state := stateRef, lintBeforeFindings := lintRef, seen := seenRef }
+  let aliasRef ← IO.mkRef Json.null
+  let env : Env := { args, root, logDir, state := stateRef, lintBeforeFindings := lintRef, seen := seenRef,
+                     aliasReport := aliasRef }
   match ← (run.run env).run with
   | .ok () => return 0
   | .error ⟨msg⟩ =>
