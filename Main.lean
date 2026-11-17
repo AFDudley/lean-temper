@@ -563,11 +563,17 @@ def stepAlias : M Unit := do
     let mut built := disk
     let mut sessions : Std.HashMap String ReplCheck.Session := {}
     let mut changedFiles : Array String := #[]
+    -- the number of accepted declarations when each declaration was tried
+    let mut accepts := 0
+    let mut triedAt : Std.HashMap Nat Nat := {}
     -- a second pass retries each declaration that failed on a form: the
     -- declarations accepted after it can change its callers and callees
     for (ui, k) in (order ++ order).zipIdx do
       let u := units[ui]!
       if k ≥ order.size && (u.form.isSome || u.attempts.any (·.1 == "analysis")) then continue
+      -- no declaration accepted since its first try: the same texts, the same result
+      if k ≥ order.size && triedAt[ui]? == some accepts then continue
+      triedAt := triedAt.insert ui accepts
       log s!"[alias] {u.decl}{if k ≥ order.size then " (second pass)" else ""}"
       let uFiles := files.filter fun rel => rel == u.file || ((disk.getD rel "").splitOn u.short).length > 1
       -- analysis on the current texts
@@ -688,6 +694,7 @@ def stepAlias : M Unit := do
               writeFile rel t
               disk := disk.insert rel t
           accepted := some form
+          accepts := accepts + 1
           units := units.set! ui { u with form := some form, files := changed, attempts }
           for rel in changed do
             unless changedFiles.contains rel do changedFiles := changedFiles.push rel
@@ -696,6 +703,9 @@ def stepAlias : M Unit := do
           sessions := sessions.filter fun rel _ => fileIdx rel ≤ m
         else
           log s!"[alias]   {form}: {(declErrs ++ callErrs)[0]!.take 300}"
+          -- the checked texts, for the reader of the report
+          let file := e.logDir / s!"alias-check-{u.short}-{attempts.size}.lean"
+          IO.FS.writeFile file ("\n\n".intercalate (dText :: callers.toList.map (·.2.2)))
           match callErrs[0]? with
           | some m => attempts := attempts.push (form, s!"at a call site: {m}")
           | none => attempts := attempts.push (form, declErrs[0]!)

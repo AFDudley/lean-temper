@@ -58,7 +58,8 @@ current file text (`Alias.elabText`, `Elab.async` off), not from the text:
 | `hv`'s equation and the side that is `rhs` | the `=` binder whose one side is an identifier node that elaborated to `v` |
 | the occurrences of `v` and `hv` in the signature and in the proof | term nodes whose expression is that free variable (`c` in `c.participants` has its own node); binders in the proof that reuse the name are other variables |
 | a call site | a term node of `app` syntax whose expression is an application of `D` |
-| the argument for `v` or `hv` | a named argument `(v := e)`; else the syntactic argument whose own term node elaborated to the application's argument at that binder's index. An implicit argument has no syntax; the receiver of dot notation is no syntactic argument |
+| the argument for `v` or `hv` | a named argument `(v := e)`; else the syntactic argument whose own term node elaborated to the application's argument at that binder's index. An implicit argument has no syntax; the receiver of dot notation is no syntactic argument. When two arguments elaborate to that term (`f order … order`), the binder's rank among the explicit binders picks the positional argument (a call by name or with `@` only) |
+| the binders that move | the groups of the `rhs` variables (the free variables of the term nodes in `rhs`) that come after the first group whose type names `v`; they go before the first kept group after `v`'s group. A group that names `v`, or whose type names a binder that stays before it, does not move (not fixed). An `rhs` variable bound by the statement (`∀ pre, order = pre ++ suf → …`) with a binder of the declaration that names `v`: not fixed |
 | a caller's own term for `v` | the two sides of `hv`'s type, instantiated with the call's arguments, are not definitionally equal (`isDefEq` in the call's context) |
 | a caller's own variable for `v` | that, and the application's argument at `v`'s index is a free variable |
 | a binder that a tactic reintroduced (`induction`, `cases`) | a free variable with the user name of `v` or `hv` and no binder node in the declaration |
@@ -72,14 +73,23 @@ error stays):
 | substituted | `v` becomes `rhs`; a `rw` rule or a `simp` lemma that names `hv` goes (the whole `rw` when it was its only rule); `subst` and `clear` of `v` or `hv`, and `cases hv`, `rcases hv`, `induction hv`, `obtain … := hv` go; `hv ▸ e` becomes `e`; another `hv` becomes `rfl` |
 | behind `generalize` | the first tactic gets `generalize hv : rhs = v at h₁ … ⊢; replace hv := hv.symm;` (`replace` only for `v = rhs`; `h₁ …` are the binders whose types named `v`); a term proof becomes `by <that>exact <term>`. `generalize` also abstracts the occurrences of `rhs` that the statement had itself |
 
-A call site loses the two arguments. When the caller passes its own term
-for `v` (see the table above), the call also gets casts with the `hv`
-argument `h`. Call-site forms, in this order:
+A call site loses the two arguments; the arguments of the moved binders go
+before the first kept explicit argument after `v`'s. When the caller passes
+its own term for `v` (see the table above), the call also gets casts with
+the `hv` argument `h`. Call-site forms, in this order:
 
 | call-site form | edit |
 |----------------|------|
 | argument casts | each other argument whose binder type names `v` becomes `(h ▸ a)`; the call becomes `(h ▸ D …)` when its type names `v` |
 | call cast | `(by obtain rfl := h; exact (D …))` when the `v` argument is a local variable, else `(h ▸ D …)` |
+| rewrite casts | for a pair whose two sides are not the same term (also when they are only definitionally equal: a later `rw` needs the caller's term): each other argument `a` whose binder type, beta reduced with the call's arguments, names `v` (sides not definitionally equal) becomes `(by rewrite [E]; exact a)`; a call whose type names `v` becomes `(by have hAlias := D …; rewrite [E] at hAlias; exact hAlias)`; an implicit argument that no remaining explicit argument determines and that is a local variable gets `(b := x)` |
+
+`E` rewrites `rhs` to the caller's term `x`: `h` (or `← h` for `v = rhs`)
+when the elaborated type of `h` has the two sides as they are; else
+`(show rhs' = x from h)`, with `x` and `rhs'` written from the call's
+argument texts (an argument without syntax: the name of its local
+variable). For `h = ?_` (a `refine` goal) the call becomes
+`((fun (hAliasEq0 : rhs' = x) => D …) ?_)` and `E` is `hAliasEq0`.
 
 Loop (`stepAlias`): one declaration at a time, the last declaration of the
 last file first. A caller then comes before its callee, so the caller's

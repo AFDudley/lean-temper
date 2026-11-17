@@ -102,14 +102,32 @@ def elabText (fileName : String) (mainModule : Name) (text : String) : IO FileEl
 
 def slice (text : String) (s e : Nat) : String := String.Pos.Raw.extract text ⟨s⟩ ⟨e⟩
 
+/-- `pre ++ t ++ post`, where `t` started at column `col` and `pre` opens a
+    tactic block (`(by …`). The lines of `t` after its first move right by
+    one amount: they keep their layout, they move as far as the first line
+    moved (`pre`'s length), and they stay right of the block's column
+    `col + 4`. -/
+def underBy (col : Nat) (pre t post : String) : String :=
+  let lines := t.splitOn "\n"
+  match lines with
+  | [] | [_] => pre ++ t ++ post
+  | first :: rest =>
+    let blank (l : String) : Bool := l.trimAscii.isEmpty
+    let indent (l : String) : Nat := (l.toList.takeWhile (· == ' ')).length
+    let contMin := rest.foldl (fun m l => if blank l then m else min m (indent l)) col
+    let shift := max pre.length (col + 5 - contMin)
+    let pad := String.ofList (List.replicate shift ' ')
+    pre ++ "\n".intercalate (first :: rest.map fun l => if blank l then l else pad ++ l) ++ post
+
 -- --- deletions ---------------------------------------------------------------
 
 def isSp (b : UInt8) : Bool := b == 32 || b == 9
 def isWs (b : UInt8) : Bool := isSp b || b == 10 || b == 13
 
-/-- The edit that deletes `[s, e)`: a line left empty goes whole; an item
-    at a line start keeps the indentation; otherwise the space before (or,
-    with none, after) the item goes with it. -/
+/-- The edit that deletes `[s, e)`: a line left empty goes whole; a line
+    left with ` :` only (the end of a signature) joins the line before; an
+    item at a line start keeps the indentation; otherwise the space before
+    (or, with none, after) the item goes with it. -/
 def deletion (text : String) (s e : Nat) : Edit := Id.run do
   let b := text.toUTF8
   let n := b.size
@@ -120,6 +138,11 @@ def deletion (text : String) (s e : Nat) : Edit := Id.run do
   let atStart := l == 0 || b[l - 1]! == 10
   let atEnd := r == n || b[r]! == 10
   if atStart && atEnd then return { start := l, stop := min (r + 1) n, replacement := "" }
+  if atStart && l > 0 && r + 1 < n && b[r]! == 58 && b[r + 1]! == 10 then
+    let mut p := l - 1
+    while p > 0 && b[p - 1]! != 10 do p := p - 1
+    unless ((slice text p (l - 1)).splitOn "--").length > 1 do
+      return { start := l - 1, stop := r, replacement := " " }
   if atStart || l == s then return { start := s, stop := r, replacement := "" }
   return { start := l, stop := e, replacement := "" }
 
@@ -1015,7 +1038,8 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
         let some (s, e) := rng? t | continue
         castArgs := castArgs.push j
         argEdits := argEdits.push
-          { start := s, stop := e, replacement := s!"(by rewrite [{", ".intercalate rs.toList}]; exact {slice fe.text s e})" }
+          { start := s, stop := e, replacement := underBy (fe.fileMap.toPosition ⟨s⟩).column
+              s!"(by rewrite [{", ".intercalate rs.toList}]; exact " (slice fe.text s e) ")" }
       let mut rsR : Array String := #[]
       for (cp, rule) in rules do
         if ← n.ti.runMetaM n.ctx (namesBinder rest doms.size cp.iv args) then rsR := rsR.push rule
@@ -1030,11 +1054,13 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
           if determined then continue
           if let some x := args[k]?.bind localName then named := named ++ s!" ({nameStr k} := {x})"
         unless named.isEmpty do argEdits := argEdits.push { start := n.stop, stop := n.stop, replacement := named }
-      let mut text? : Option String := none
-      unless rsR.isEmpty do
-        text? := some s!"(by have hAlias := {appText argEdits}; rewrite [{", ".intercalate rsR.toList}] at hAlias; exact hAlias)"
-      unless lambdas.isEmpty do
-        text? := some s!"((fun {" ".intercalate lambdas.toList} => {text?.getD (appText argEdits)}) {" ".intercalate holes.toList})"
+      let lamPre := if lambdas.isEmpty then "" else s!"((fun {" ".intercalate lambdas.toList} => "
+      let lamPost := if lambdas.isEmpty then "" else s!") {" ".intercalate holes.toList})"
+      let inner : Option String :=
+        if !rsR.isEmpty then some (underBy (pos.column + lamPre.length) "(by have hAlias := " (appText argEdits)
+          s!"; rewrite [{", ".intercalate rsR.toList}] at hAlias; exact hAlias)")
+        else if !lambdas.isEmpty then some (appText argEdits) else none
+      let text? := inner.map (lamPre ++ · ++ lamPost)
       match text? with
       | some t => rewrite := rewrite.push { start := n.start, stop := n.stop, replacement := t }
       | none => rewrite := rewrite ++ argEdits
@@ -1064,7 +1090,7 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
     let app := appText dels
     let wrapped := if casts.all (·.2.2) then
         let obtains := casts.foldl (fun acc (_, h, _) => acc ++ s!"obtain rfl := {h}; ") ""
-        s!"(by {obtains}exact ({app}))"
+        underBy pos.column s!"(by {obtains}exact (" app "))"
       else s!"({castWith casts app})"
     callCast := callCast.push { start := n.start, stop := n.stop, replacement := wrapped }
   -- a rename inside a call's edit is part of that edit's text
