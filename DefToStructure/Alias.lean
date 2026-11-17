@@ -190,6 +190,10 @@ structure Pair where
   /-- `true` for `hv : v = rhs`, `false` for `hv : rhs = v`. -/
   vLeft : Bool
   rhsText : String
+  /-- The variables that `rhs` names: their ranges in `rhsText` and their names. -/
+  holes : Array (Nat × Nat × String) := #[]
+  /-- The variables that `rhs` names: their free variables. -/
+  holeIds : Array FVarId := #[]
   vIds : Array FVarId
   hvIds : Array FVarId
   vIdent : Syntax
@@ -219,6 +223,13 @@ structure DeclEdits where
   /-- The proof names `v` or `hv`. -/
   proofNames : Bool
   pairs : Array Pair
+  /-- The end of the declaration's name: the fresh name of a check goes there. -/
+  declIdEnd : Nat
+  /-- The range of `:= proof`, and whether the command is a `theorem`. -/
+  valueRange : Nat × Nat
+  isTheorem : Bool
+  /-- The binders that moved before `v`'s place (`rhs` names them), in order. -/
+  moved : Array String := #[]
 
 def atomic (rhs : Syntax) : Bool :=
   rhs.isIdent || rhs.isOfKind ``Parser.Term.paren || rhs.isOfKind ``Parser.Term.num ||
@@ -280,9 +291,22 @@ def findPair (fe : FileElab) (ns : Array Node) (parts : DeclParts) (f : Finding)
   let sides (t : Syntax) : Option (Bool × Syntax) :=
     if !t.isOfKind ``«term_=_» then none
     else if isV t[0] then some (true, t[2]) else if isV t[2] then some (false, t[0]) else none
-  let rhsOf (side : Syntax) : Except String String := do
+  -- `rhs`'s text (in parentheses unless atomic) and the variables in it
+  let rhsOf (side : Syntax) : Except String (String × Array (Nat × Nat × String) × Array FVarId) := do
     let some (ss, se) := rng? side | throw "no range"
-    return if atomic side then slice fe.text ss se else s!"({slice fe.text ss se})"
+    let paren := !atomic side
+    let off := if paren then 1 else 0
+    let mut holes : Array (Nat × Nat × String) := #[]
+    let mut ids : Array FVarId := #[]
+    for n in ns do
+      unless ss ≤ n.start && n.stop ≤ se && !n.ti.isBinder do continue
+      let .fvar id := n.ti.expr.consumeMData | continue
+      if holes.any (fun (a, _, _) => a == n.start - ss + off) then continue
+      let some ld := n.ti.lctx.find? id | continue
+      holes := holes.push (n.start - ss + off, n.stop - ss + off, ld.userName.eraseMacroScopes.toString (escape := false))
+      unless ids.contains id do ids := ids.push id
+    let text := slice fe.text ss se
+    return (if paren then s!"({text})" else text, holes.qsort (·.1 < ·.1), ids)
   let base : Pair := { finding := f, v := f.binder, hv := "", vLeft := true, rhsText := "", vIds, hvIds := #[],
                        vIdent, vGroup := vGi?.map (parts.groups[·]!), hvGroup := none, stmtDel := vStmtDel }
   -- `hv`: a later binder of the declaration
@@ -292,7 +316,8 @@ def findPair (fe : FileElab) (ns : Array Node) (parts : DeclParts) (f : Finding)
       unless g.idents.size == 1 do continue
       let some (vLeft, side) := sides t | continue
       let some hr := rng? g.idents[0]! | continue
-      return { base with hv := identName g.idents[0]!, vLeft, rhsText := ← rhsOf side,
+      let (rhsText, holes, holeIds) ← rhsOf side
+      return { base with hv := identName g.idents[0]!, vLeft, rhsText, holes, holeIds,
                          hvIds := fvarsAt ns hr true, hvGroup := some g }
   -- `hv`: a premise of the statement
   for a in typeNodes do
@@ -300,7 +325,8 @@ def findPair (fe : FileElab) (ns : Array Node) (parts : DeclParts) (f : Finding)
     let some (vLeft, side) := sides a[0] | continue
     let some (s, _) := rng? a[0] | continue
     let some (_, e) := rng? a[1] | continue
-    return { base with vLeft, rhsText := ← rhsOf side, stmtDel := vStmtDel.push (s, e) }
+    let (rhsText, holes, holeIds) ← rhsOf side
+    return { base with vLeft, rhsText, holes, holeIds, stmtDel := vStmtDel.push (s, e) }
   throw s!"no equation `{f.binder} = …` among the binders and premises"
 
 /-- The proof's first tactic, or the term, and whether it is a tactic block. -/
@@ -429,15 +455,19 @@ def occurrenceEdit (text : String) (cmd : Syntax) (n : Node) (name : String) (is
         return { start := ts, stop := te, replacement := slice text rs re }
   return { start := n.start, stop := n.stop, replacement := if isHv then "rfl" else rhsText }
 
-/-- Drop the edits that lie inside another edit; refuse partial overlaps. -/
+/-- Drop the edits that lie inside another edit; refuse partial overlaps.
+    An insertion at the start or the end of another edit is kept: it goes
+    before that edit (`applyEdits` applies it after, at the same offset). -/
 def nest (edits : Array Edit) : Except String (Array Edit) := do
-  let sorted := edits.qsort fun a b => a.start < b.start || (a.start == b.start && a.stop > b.stop)
+  let ins (e : Edit) : Bool := e.start == e.stop
+  let sorted := edits.qsort fun a b =>
+    a.start < b.start || (a.start == b.start && ((ins a && !ins b) || (ins a == ins b && a.stop > b.stop)))
   let mut out : Array Edit := #[]
   for ed in sorted do
     match out.back? with
     | some last =>
       if ed == last then continue
-      if last.start ≤ ed.start && ed.stop ≤ last.stop && last.start < last.stop then continue
+      if last.start ≤ ed.start && ed.stop ≤ last.stop && last.start < last.stop && !(ins ed && ed.start == last.stop) then continue
       if ed.start < last.stop then throw s!"two edits overlap at byte {ed.start}"
       out := out.push ed
     | none => out := out.push ed
@@ -478,7 +508,9 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
   let ns := nodesIn fe cs ce
   let pairs ← fs.mapM (findPair fe ns parts)
   let some (_, sigEnd) := rng? parts.type | throw "no type range"
-  let some (valStart, _) := rng? parts.value | throw "no value range"
+  let some (valStart, valStop) := rng? parts.value | throw "no value range"
+  let decl := parts.cmd[1]
+  let some (_, declIdEnd) := rng? decl[1] | throw "no range for the declaration's name"
   -- the deleted ranges: the `v` identifiers (a group whose identifiers all go,
   -- whole) and the `hv` groups
   let mut del : Array (Nat × Nat) := #[]
@@ -544,7 +576,53 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
             for i in g.idents do
               unless hyps.contains (identName i) do hyps := hyps.push (identName i)
     atHyps := atHyps.push hyps
-  let sig := deletions fe.text del ++ subst
+  -- `rhs` must be in scope where it replaces `v`: the groups of the `rhs`
+  -- variables that the declaration binds after the first group whose type
+  -- names `v` move before the first kept group after `v`'s group (the call
+  -- sites move their arguments the same way, `callSites`)
+  let groupIdx (id : FVarId) : Option Nat := parts.groups.findIdx? fun g =>
+    g.idents.any fun i => match rng? i with
+      | some r => (fvarsAt ns r true).contains id
+      | none => false
+  let gRange (gi : Nat) : Option (Nat × Nat) := rng? parts.groups[gi]!.stx
+  let some (ts, te) := rng? parts.type | throw "no type range"
+  let stmtBound (id : FVarId) : Bool := ns.any fun n =>
+    n.ti.isBinder && ts ≤ n.start && n.stop ≤ te && n.ti.expr.consumeMData == .fvar id
+  let mut moves : Array Edit := #[]
+  let mut moved : Array String := #[]
+  for p in pairs do
+    let some vg := p.vGroup | continue
+    let some vGi := parts.groups.findIdx? (rng? ·.stx == rng? vg.stx) | continue
+    let namesV (gi : Nat) : Bool := match gRange gi with
+      | some (gs, ge) => subst.any fun ed => gs ≤ ed.start && ed.stop ≤ ge
+      | none => false
+    let some fv := (List.range parts.groups.size).find? (fun gi => gi > vGi && namesV gi) | continue
+    if let some id := p.holeIds.find? stmtBound then
+      let nm := (ns.findSome? fun n => if n.ti.expr.consumeMData == .fvar id then
+        (n.ti.lctx.find? id).map (·.userName.eraseMacroScopes.toString) else none).getD "?"
+      throw s!"`rhs` names `{nm}`, a variable of the statement, and a binder of the declaration names `{p.v}`"
+    let late := (p.holeIds.filterMap groupIdx).filter (· > fv)
+    let G := late.toList.eraseDups.toArray.qsort (· < ·)
+    if G.isEmpty then continue
+    for gi in G do
+      if namesV gi || parts.groups[gi]!.idents.isEmpty then
+        throw s!"the binder group of an `rhs` variable cannot move: it names `{p.v}` or has no name"
+      let some (gs, ge) := gRange gi | throw "no range"
+      for n in ns do
+        unless gs ≤ n.start && n.stop ≤ ge && !n.ti.isBinder do continue
+        let .fvar id := n.ti.expr.consumeMData | continue
+        if let some gj := groupIdx id then
+          if gj > vGi && gj < gi && !G.contains gj then
+            throw s!"the binder group of an `rhs` variable cannot move before `{p.v}`: its type names a later binder"
+    let some a := (List.range parts.groups.size).find? (fun gi =>
+        gi > vGi && !G.contains gi && !(gRange gi).any fun (s, e) => inDel s e) | continue
+    let some (as, _) := gRange a | continue
+    let text := " ".intercalate (G.toList.filterMap fun gi => (gRange gi).map fun (s, e) => slice fe.text s e)
+    moves := moves.push { start := as, stop := as, replacement := text ++ " " }
+    for gi in G do
+      if let some r := gRange gi then del := del.push r
+      moved := moved ++ parts.groups[gi]!.idents.map identName
+  let sig := deletions fe.text del ++ subst ++ moves
   let inStatement := pairs.any (·.inStatement)
   -- the statement's own binders change the proof's `intro`s: only `restated` keeps the proof
   if inStatement then proof := .error "`v` or `hv` is part of the statement: the proof's `intro`s depend on them"
@@ -630,51 +708,153 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
     -- one line: the line breaks of the copied texts become spaces
     let oneLine := " ".intercalate ((text.splitOn "\n").map (·.trimAsciiStart.copy))
     return some { start := ps, stop := ps, replacement := oneLine }
-  return { sig, proof := proof >>= nest, preamble, restated, proofNames := names, pairs }
+  return { sig, proof := proof >>= nest, preamble, restated, proofNames := names, pairs, declIdEnd,
+           valueRange := (valStart, valStop), isTheorem := decl.isOfKind ``Parser.Command.theorem, moved }
 
 -- --- call sites ------------------------------------------------------------------
 
-/-- The call-site edits in one file. A call loses the two arguments. When
-    the two sides of the `hv` equation, instantiated with the call's
-    arguments, are not definitionally equal (the caller passes its own term
-    for `v`), the call also gets casts with the `hv` argument `h`, in two
-    forms. `argCasts`: each other argument whose binder type names `v`
-    becomes `(h ▸ a)`, and the call becomes `(h ▸ D …)` when its type
-    names `v`. `callCast`: `(by obtain rfl := h; exact (D …))` when the `v`
-    argument is a local variable, else `(h ▸ D …)`. -/
+/-- One pair as the call sites need it. -/
+structure SitePair where
+  v : String
+  hv : String
+  /-- `true` for `hv : v = rhs`. -/
+  vLeft : Bool := true
+  /-- `rhs`'s text and the variables in it (`Pair.holes`). -/
+  rhsText : String := ""
+  holes : Array (Nat × Nat × String) := #[]
+  deriving Inhabited
+
+def Pair.site (p : Pair) : SitePair :=
+  { v := p.v, hv := p.hv, vLeft := p.vLeft, rhsText := p.rhsText, holes := p.holes }
+
+/-- The call-site edits in one file. A call loses the two arguments; the
+    arguments of the binders that moved (`DeclEdits.moved`) go before the
+    first kept argument after `v`'s. When the two sides of the `hv`
+    equation, instantiated with the call's arguments, are not
+    definitionally equal (the caller passes its own term for `v`), the call
+    also gets casts with the `hv` argument `h`, in three forms.
+    `argCasts`: each other argument whose binder type names `v` becomes
+    `(h ▸ a)`, and the call becomes `(h ▸ D …)` when its type names `v`.
+    `callCast`: `(by obtain rfl := h; exact (D …))` when the `v` argument is
+    a local variable, else `(h ▸ D …)`. `rewriteCasts` (also when the two
+    sides are only not the same term): see `callSites`. -/
 structure Sites where
   argCasts : Array Edit
   callCast : Array Edit
+  /-- An error when a call has no text for its equation. -/
+  rewriteCasts : Except String (Array Edit) := .ok #[]
   /-- A reason when a call site could not be mapped. -/
   problem : Option String
 
-/-- Every call of `d` in `fe` outside `skip`, for the pairs `(v, hv)`. -/
-def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (skip : Nat × Nat := (0, 0)) : IO Sites := do
+/-- The binder infos of `d`'s type, in order. -/
+def binderInfos (env : Environment) (d : Name) : Option (Array BinderInfo) := do
+  let ci ← env.find? d
+  let rec go (t : Expr) (acc : Array BinderInfo) (fuel : Nat) : Array BinderInfo :=
+    match fuel, t with
+    | fuel + 1, .forallE _ _ b bi => go b (acc.push bi) fuel
+    | _, _ => acc
+  pure (go ci.type #[] 10000)
+
+/-- `t`, with loose bound variables for the binders `0 … k - 1`, instantiated
+    with `args`: does it name binder `iv` after beta reduction? -/
+def namesBinder (t : Expr) (k iv : Nat) (args : Array Expr) : CoreM Bool := do
+  if iv ≥ k then return false
+  if args.size < k then return t.hasLooseBVar (k - 1 - iv)
+  let marker : FVarId := ⟨`_aliasMarker⟩
+  let xs := (args.extract 0 k).set! iv (.fvar marker)
+  let e ← Core.betaReduce (t.instantiateRev xs)
+  return e.containsFVar marker
+
+/-- One pair at one call. -/
+structure CallPair where
+  iv : Nat
+  ih : Nat
+  sp : SitePair
+  av : Option ((Nat × Nat) × Syntax)
+  ah : Option ((Nat × Nat) × Syntax)
+  /-- The sides of the instantiated `hv` equation: `v`'s argument and `rhs`. -/
+  vSide : Expr
+  rSide : Expr
+  synDiff : Bool
+  defDiff : Bool
+
+/-- Every call of `d` in `fe` outside `skip`, for the pairs `(v, hv)`. With
+    a `suffix`, every reference to `d` outside `skip` (a call's function, an
+    identifier) also gets `suffix` after it: the edits then name the fresh
+    declaration of a check (`ReplCheck`).
+
+    Two arguments that elaborate to the same term: positional arguments fill
+    the explicit binders in order, so the rank of the binder among the
+    explicit binders picks the argument (a call by name or with `@`).
+
+    `rewriteCasts`, for a pair whose two sides are not the same term: each
+    other argument `a` whose binder type (beta reduced, with the call's
+    arguments) names `v` and whose sides are not definitionally equal
+    becomes `(by rewrite [E]; exact a)`; a call whose type names `v` becomes
+    `(by have hAlias := D …; rewrite [E] at hAlias; exact hAlias)`. `E`
+    rewrites `rhs` to the caller's term: `h` when its type has the two sides
+    as they are; else `(show rhs' = x from h)` with `x` and `rhs'` written
+    from the call's argument texts (an argument without syntax: the name of
+    the local variable); for `h = ?_` a function `(fun (hAliasEqN : …) => …) ?_`.
+    An implicit argument that no remaining explicit argument determines and
+    that is a local variable gets a named argument `(b := x)`. -/
+def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat × Nat := (0, 0))
+    (suffix : String := "") (moved : Array String := #[]) : IO Sites := do
   let fail (msg : String) : Sites := { argCasts := #[], callCast := #[], problem := some msg }
   let some names := binderNames fe.env d | return fail s!"{d} is not in the environment"
+  let some bis := binderInfos fe.env d | return fail s!"{d} is not in the environment"
   let some ci := fe.env.find? d | return fail s!"{d} is not in the environment"
+  let nameStr (k : Nat) : String := (names[k]?.map (·.eraseMacroScopes.toString (escape := false))).getD ""
   let allDoms := (telescope ci.type names.size).1
   let mut idx : Array (Nat × Nat) := #[]
-  for (v, _) in pairs do
-    let some iv := names.idxOf? (Name.mkSimple v) | return fail s!"{d}'s type does not bind `{v}`"
-    let some ih := eqIndexAfter allDoms iv iv | return fail s!"{d}'s type has no equation for `{v}`"
+  for sp in pairs do
+    let some iv := names.idxOf? (Name.mkSimple sp.v) | return fail s!"{d}'s type does not bind `{sp.v}`"
+    let some ih := eqIndexAfter allDoms iv iv | return fail s!"{d}'s type has no equation for `{sp.v}`"
     idx := idx.push (iv, ih)
+  let mIdx := (moved.filterMap fun nm => (List.range names.size).find? (nameStr · == nm)).qsort (· < ·)
+  let deleted (j : Nat) : Bool := idx.any fun (iv, ih) => j == iv || j == ih
   let byRange : Std.HashMap (Nat × Nat) (Array Node) :=
     fe.nodes.foldl (init := {}) fun m n => m.insert (n.start, n.stop) ((m.getD (n.start, n.stop) #[]).push n)
+  let outside (n : Node) : Bool := !(skip.1 ≤ n.start && n.stop ≤ skip.2)
+  let renames : Array Edit := if suffix.isEmpty then #[] else Id.run do
+    let mut ends : Array Nat := #[]
+    for n in fe.nodes do
+      unless n.ti.expr.consumeMData.getAppFn.constName? == some d && !n.ti.isBinder && outside n do continue
+      let e? := if n.ti.stx.isIdent then some n.stop
+        else if n.ti.stx.isOfKind ``Parser.Term.app then (rng? n.ti.stx[0]).map (·.2) else none
+      if let some e := e? then
+        unless ends.contains e do ends := ends.push e
+    return ends.map fun e => { start := e, stop := e, replacement := suffix }
   let mut argCasts : Array Edit := #[]
   let mut callCast : Array Edit := #[]
+  let mut rewrite : Array Edit := #[]
+  let mut rewriteErr : Option String := none
   let mut done : Array (Nat × Nat) := #[]
   for n in fe.nodes do
     unless n.ti.expr.consumeMData.getAppFn.constName? == some d && !n.ti.isBinder do continue
     unless n.ti.stx.isOfKind ``Parser.Term.app do continue
     if done.contains (n.start, n.stop) then continue
-    if skip.1 ≤ n.start && n.stop ≤ skip.2 then continue
+    unless outside n do continue
     done := done.push (n.start, n.stop)
     let pos := fe.fileMap.toPosition ⟨n.start⟩
     let full ← n.instExpr
     let args := full.getAppArgs
     let synArgs := n.ti.stx[1].getArgs
     let (doms, rest) := telescope ci.type args.size
+    let fnStx := n.ti.stx[0]
+    let explicitMode := fnStx.isOfKind ``Parser.Term.explicit
+    let fnIdent := if explicitMode then fnStx[1] else fnStx
+    let direct := explicitMode || (fnIdent.isIdent &&
+      let fc := fnIdent.getId.eraseMacroScopes.components
+      let dc := d.components
+      fc.length ≤ dc.length && dc.drop (dc.length - fc.length) == fc)
+    let positional := synArgs.filter fun a =>
+      !a.isOfKind ``Parser.Term.namedArgument && !a.isOfKind ``Parser.Term.ellipsis
+    let namedNames := synArgs.filterMap fun a =>
+      if a.isOfKind ``Parser.Term.namedArgument then some (identName a[1]) else none
+    let isExplicit (k : Nat) : Bool := explicitMode || (bis[k]?.any (·.isExplicit))
+    let explicitIdx := (List.range (min args.size bis.size)).toArray.filter fun k =>
+      isExplicit k && !namedNames.contains (nameStr k)
     -- the syntactic argument for binder index `i` named `nm`: its range and its term
     let argFor (i : Nat) (nm : String) : IO (Except String (Option ((Nat × Nat) × Syntax))) := do
       if let some a := synArgs.find? fun a => a.isOfKind ``Parser.Term.namedArgument && identName a[1] == nm then
@@ -682,51 +862,193 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (ski
       if i ≥ args.size then return .ok none
       let target := args[i]!
       let mut hits : Array ((Nat × Nat) × Syntax) := #[]
-      for a in synArgs do
-        if a.isOfKind ``Parser.Term.namedArgument || a.isOfKind ``Parser.Term.ellipsis then continue
+      for a in positional do
         let some r := rng? a | continue
         for cand in byRange.getD r #[] do
           if (← cand.instExpr) == target && !hits.any (·.1 == r) then hits := hits.push (r, a)
       if hits.size > 1 then
-        return .error s!"{pos.line}:{pos.column}: two arguments of a call elaborate to the argument for `{nm}`"
+        -- positional arguments fill the explicit binders in order
+        let byRank : Option (Nat × Nat) := if direct then do
+            let rank ← explicitIdx.idxOf? i
+            rng? (← positional[rank]?)
+          else none
+        match byRank.bind fun r => hits.find? (·.1 == r) with
+        | some h => return .ok (some h)
+        | none => return .error s!"{pos.line}:{pos.column}: two arguments of a call elaborate to the argument for `{nm}`"
       return .ok hits[0]?
-    -- the `hv` equation of this call: are its sides definitionally equal?
-    let sidesDiffer (ih : Nat) : IO Bool := do
-      let some dom := doms[ih]? | return false
+    -- an implicit binder has syntax only as a named argument
+    let syntaxFor (k : Nat) : IO (Option ((Nat × Nat) × Syntax)) := do
+      if !isExplicit k && !namedNames.contains (nameStr k) then return none
+      match ← argFor k (nameStr k) with
+      | .ok a => return a
+      | .error _ => return none
+    -- the name of a local variable, when it means that variable at the call
+    let localName (x : Expr) : Option String := do
+      let .fvar id := x | none
+      let ld ← n.ti.lctx.find? id
+      guard (!ld.userName.hasMacroScopes)
+      let ld' ← n.ti.lctx.findFromUserName? ld.userName
+      guard (ld'.fvarId == id)
+      pure (ld.userName.toString (escape := false))
+    -- the text of binder `k`'s argument at this call
+    let argText (k : Nat) : IO (Option String) := do
+      match ← syntaxFor k with
+      | some (_, t) => return (rng? t).map fun (s, e) =>
+          let x := slice fe.text s e
+          if (atomic t) then x else s!"({x})"
+      | none => return (args[k]?.bind localName)
+    -- the `hv` equation of this call
+    let eqOf (ih : Nat) : Option Expr := do
+      let dom ← doms[ih]?
       let eq := (dom.instantiateLevelParams ci.levelParams full.getAppFn.constLevels!).instantiateRev
         (args.extract 0 ih)
-      unless eq.isAppOfArity ``Eq 3 do return false
-      return !(← n.ti.runMetaM n.ctx (isDefEq (eq.getArg! 1) (eq.getArg! 2)))
+      guard (eq.isAppOfArity ``Eq 3)
+      pure eq
     let mut toDelete : Array (Nat × Nat) := #[]
     let mut casts : Array (Nat × String × Bool) := #[]
-    for ((iv, ih), (v, hv)) in idx.zip pairs do
-      let av ← match ← argFor iv v with
+    let mut cps : Array CallPair := #[]
+    for ((iv, ih), sp) in idx.zip pairs do
+      let av ← match ← argFor iv sp.v with
         | .ok a => pure a
         | .error msg => return fail msg
-      let ah ← match ← argFor ih hv with
+      let ah ← match ← argFor ih sp.hv with
         | .ok a => pure a
         | .error msg => return fail msg
       if let some (r, _) := av then toDelete := toDelete.push r
-      if let some (r, t) := ah then
-        toDelete := toDelete.push r
+      if let some (r, _) := ah then toDelete := toDelete.push r
+      let some eq := eqOf ih | continue
+      let (vSide, rSide) := if sp.vLeft then (eq.getArg! 1, eq.getArg! 2) else (eq.getArg! 2, eq.getArg! 1)
+      let defDiff := !(← n.ti.runMetaM n.ctx (isDefEq (eq.getArg! 1) (eq.getArg! 2)))
+      cps := cps.push { iv, ih, sp, av, ah, vSide, rSide, synDiff := eq.getArg! 1 != eq.getArg! 2, defDiff }
+      if let some (_, t) := ah then
         let some (ts, te) := rng? t | continue
-        if iv < args.size && (← sidesDiffer ih) then
+        if iv < args.size && defDiff then
           casts := casts.push (iv, slice fe.text ts te, args[iv]!.isFVar)
-    let dels := deletions fe.text toDelete
+    -- the moved binders' arguments go before the first kept explicit argument after `v`'s
+    let mut moveIns : Array Edit := #[]
+    unless mIdx.isEmpty do
+      let mut texts : Array String := #[]
+      let mut ranges : Array (Nat × Nat) := #[]
+      for k in mIdx do
+        if let some (r, t) ← syntaxFor k then
+          if positional.any (rng? · == some r) then
+            ranges := ranges.push r
+            texts := texts.push ((rng? t).map (fun (s, e) => slice fe.text s e) |>.getD "")
+      let lo := idx.foldl (fun a (iv, _) => min a iv) names.size
+      let hi := mIdx.foldl min names.size
+      let mut anchor : Option Nat := none
+      for j in [lo + 1:hi] do
+        if anchor.isSome || deleted j || !isExplicit j then continue
+        if let some (r, _) ← syntaxFor j then
+          if positional.any (rng? · == some r) then anchor := some r.1
+      if let some a := anchor then
+        unless ranges.isEmpty do
+          moveIns := #[{ start := a, stop := a, replacement := " ".intercalate texts.toList ++ " " }]
+          toDelete := toDelete ++ ranges
+    let dels := deletions fe.text toDelete ++ moveIns ++ renames.filter fun r => n.start ≤ r.start && r.stop ≤ n.stop
+    let toLocal (eds : Array Edit) : Array Edit :=
+      eds.map fun ed => { ed with start := ed.start - n.start, stop := min ed.stop n.stop - n.start }
+    let appText (eds : Array Edit) : String := applyEdits (slice fe.text n.start n.stop) (toLocal eds)
+    -- `rewriteCasts`
+    let relevant := cps.filter fun cp => cp.synDiff && cp.iv < args.size
+    if relevant.isEmpty then rewrite := rewrite ++ dels
+    else
+      let mut rules : Array (CallPair × String) := #[]
+      let mut lambdas : Array String := #[]
+      let mut holes : Array String := #[]
+      for cp in relevant do
+        let x? ← argText cp.iv
+        -- `rhs` written with the call's argument texts
+        let mut r? : Option String := some ""
+        let mut last := 0
+        for (s, e, nm) in cp.sp.holes do
+          let k? := (List.range names.size).find? (nameStr · == nm)
+          let t? ← match k? with
+            | some k => argText k
+            | none => pure none
+          r? := match r?, t? with
+            | some acc, some t => some (acc ++ slice cp.sp.rhsText last s ++ t)
+            | _, _ => none
+          last := e
+        let rText? := r?.map (· ++ slice cp.sp.rhsText last cp.sp.rhsText.utf8ByteSize)
+        let printed := match x?, rText? with
+          | some x, some r => some (if cp.sp.vLeft then s!"{x} = {r}" else s!"{r} = {x}")
+          | _, _ => none
+        let hText? := match cp.ah with
+          | some (_, t) => (rng? t).map fun (s, e) => let h := slice fe.text s e; if (atomic t) then h else s!"({h})"
+          | none => args[cp.ih]?.bind localName
+        let isHole := cp.ah.any (·.2.isOfKind ``Parser.Term.syntheticHole)
+        let hType ← n.ti.runMetaM n.ctx do
+          match args[cp.ih]? with
+          | some h => return some (← instantiateMVars (← inferType h))
+          | none => return none
+        let asIs := match hType with
+          | some t => t.isAppOfArity ``Eq 3 && (if cp.sp.vLeft then t.getArg! 1 == cp.vSide && t.getArg! 2 == cp.rSide
+              else t.getArg! 1 == cp.rSide && t.getArg! 2 == cp.vSide)
+          | none => false
+        let term? : Option String := if isHole then
+            printed.map fun _ =>
+              let nm := s!"hAliasEq{lambdas.size}"
+              nm
+          else if asIs then hText?
+          else match printed, hText? with
+            | some eq, some h => some s!"(show {eq} from {h})"
+            | _, h => h
+        match term? with
+        | none =>
+          rewriteErr := some s!"{pos.line}:{pos.column}: no text for the equation `{cp.sp.hv}` at this call"
+        | some term =>
+          if isHole then
+            lambdas := lambdas.push s!"({term} : {printed.getD ""})"
+            holes := holes.push (cp.ah.map (fun ((s, e), _) => slice fe.text s e) |>.getD "?_")
+          rules := rules.push (cp, (if cp.sp.vLeft then "← " else "") ++ term)
+      -- the arguments whose types name a `v` with a caller's own term
+      let mut argEdits := dels
+      let mut castArgs : Array Nat := #[]
+      for j in [0:min args.size doms.size] do
+        if deleted j || mIdx.contains j then continue
+        let mut rs : Array String := #[]
+        for (cp, rule) in rules do
+          if cp.defDiff && (← n.ti.runMetaM n.ctx (namesBinder doms[j]! j cp.iv args)) then rs := rs.push rule
+        if rs.isEmpty then continue
+        let some ((_, _), t) ← syntaxFor j | continue
+        let some (s, e) := rng? t | continue
+        castArgs := castArgs.push j
+        argEdits := argEdits.push
+          { start := s, stop := e, replacement := s!"(by rewrite [{", ".intercalate rs.toList}]; exact {slice fe.text s e})" }
+      let mut rsR : Array String := #[]
+      for (cp, rule) in rules do
+        if ← n.ti.runMetaM n.ctx (namesBinder rest doms.size cp.iv args) then rsR := rsR.push rule
+      -- implicit arguments that no remaining explicit argument determines
+      if !castArgs.isEmpty || !rsR.isEmpty then
+        let mut named : String := ""
+        for k in [0:min args.size doms.size] do
+          if isExplicit k || deleted k || namedNames.contains (nameStr k) then continue
+          unless bis[k]!.isImplicit || bis[k]!.isStrictImplicit do continue
+          let determined := (List.range (min args.size doms.size)).any fun j =>
+            j > k && isExplicit j && !deleted j && !castArgs.contains j && doms[j]!.hasLooseBVar (j - 1 - k)
+          if determined then continue
+          if let some x := args[k]?.bind localName then named := named ++ s!" ({nameStr k} := {x})"
+        unless named.isEmpty do argEdits := argEdits.push { start := n.stop, stop := n.stop, replacement := named }
+      let mut text? : Option String := none
+      unless rsR.isEmpty do
+        text? := some s!"(by have hAlias := {appText argEdits}; rewrite [{", ".intercalate rsR.toList}] at hAlias; exact hAlias)"
+      unless lambdas.isEmpty do
+        text? := some s!"((fun {" ".intercalate lambdas.toList} => {text?.getD (appText argEdits)}) {" ".intercalate holes.toList})"
+      match text? with
+      | some t => rewrite := rewrite.push { start := n.start, stop := n.stop, replacement := t }
+      | none => rewrite := rewrite ++ argEdits
     if casts.isEmpty then
       argCasts := argCasts ++ dels
       callCast := callCast ++ dels
       continue
     let castWith (hs : Array (Nat × String × Bool)) (t : String) : String :=
       hs.foldr (fun (_, h, _) acc => h ++ " ▸ " ++ acc) t
-    let toLocal (eds : Array Edit) : Array Edit :=
-      eds.map fun ed => { ed with start := ed.start - n.start, stop := min ed.stop n.stop - n.start }
-    let appText (eds : Array Edit) : String := applyEdits (slice fe.text n.start n.stop) (toLocal eds)
     -- `argCasts`: the other arguments whose binder types name `v`
     let mut argEdits := dels
     for j in [0:args.size] do
       let hs := casts.filter fun (iv, _, _) => iv < j && (doms[j]?.any (·.hasLooseBVar (j - 1 - iv)))
-      if hs.isEmpty || idx.any (fun (iv, ih) => j == iv || j == ih) then continue
+      if hs.isEmpty || deleted j then continue
       let some nm := names[j]? | continue
       match ← argFor j (nm.eraseMacroScopes.toString (escape := false)) with
       | .ok (some ((s, e), _)) =>
@@ -745,6 +1067,12 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (ski
         s!"(by {obtains}exact ({app}))"
       else s!"({castWith casts app})"
     callCast := callCast.push { start := n.start, stop := n.stop, replacement := wrapped }
-  return { argCasts, callCast, problem := none }
+  -- a rename inside a call's edit is part of that edit's text
+  let rewriteCasts : Except String (Array Edit) := match rewriteErr with
+    | some msg => .error msg
+    | none => nest (rewrite ++ renames)
+  match nest (argCasts ++ renames), nest (callCast ++ renames) with
+  | .ok a, .ok b => return { argCasts := a, callCast := b, rewriteCasts, problem := none }
+  | .error msg, _ | _, .error msg => return fail msg
 
 end DefToStructure.Alias

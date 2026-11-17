@@ -26,16 +26,21 @@ worktree, never a live branch. Every `lake` command runs as
 `~/.elan/bin` on `PATH` and `CI` unset. Logs, `state.json` and the LSP log
 go to `<checkout>/.scratch/codemod/`.
 
-Tests: `.lake/build/bin/tests <checkout>` (the snippets parse with `Init`
+Tests: `.lake/build/bin/tests <checkout> <repl>` (the snippets parse with `Init`
 and `Mathlib.Tactic.Says` from the checkout; the alias cases elaborate with
-`Init`).
+`Init`; the REPL case runs `<repl>`, the Lean REPL).
 
 ## Alias mode
 
 ```
 .lake/build/bin/def_to_structure --checkout /path/to/armada-lean-worktree \
-  --slot 3 --alias WORKLIST.json --report scripts/codemod/alias-report.json
+  --slot 3 --alias WORKLIST.json --repl /path/to/repl/.lake/build/bin/repl \
+  --report scripts/codemod/alias-report.json
 ```
+
+`--repl` is the Lean REPL (https://github.com/leanprover-community/repl)
+built at the target's toolchain; the tool starts it with the target's
+`LEAN_PATH`.
 
 The work list holds `aliasHypothesis` findings of `scripts/type_lint.lean`
 (`declaration`, `binder` v, `rhs`, `at`). For each declaration the mode
@@ -80,13 +85,31 @@ Loop (`stepAlias`): one declaration at a time, the last declaration of the
 last file first. A caller then comes before its callee, so the caller's
 arguments are already `rhs`, not its own variable. For each declaration:
 the analysis of its file and of every file that names it, on their current
-texts; then the forms, their files written and checked in import order
-through `lake serve`. An error in the declaration's own command moves to
-the next proof form; an error elsewhere is at a call site and moves to the
-next call-site form. A module is rebuilt (`lake build <Module>`) before a
-file that imports it is elaborated or checked. With no form left, the files
-go back to their texts before the declaration. A second pass retries each
-declaration that failed on a form.
+texts; then the forms, each checked through the Lean REPL
+(`DefToStructure/ReplCheck.lean`). An error in the declaration moves to the
+next proof form; an error in a caller moves to the next call-site form. The
+first form without an error is written to the files; with none, the files
+keep their texts. A module is rebuilt (`lake build <Module>`) before a file
+that imports it is elaborated. A second pass retries each declaration that
+failed on a form.
+
+The REPL check. Each file of a check runs once in the REPL, one command per
+request, so that the environment after each command stays available
+(`ReplCheck.Session`; the command boundaries come from the in-process
+elaboration). After an accepted form, the next check runs again only the
+commands from the first changed one on, and a file after the first changed
+file in import order starts again (its imports changed). A Lean environment
+cannot lose a constant, so a candidate is checked under a fresh name
+`D_aliasCheck`: the new declaration in the environment before `D`; then each
+changed command that names `D` (every reference renamed to
+`D_aliasCheck`) in the environment before that command, after the
+declaration (its proof `sorry` for a theorem: a caller needs its type only)
+is added there. When the scopes at the caller differ from the scopes at `D`,
+that addition closes the caller's namespaces and sections, opens `D`'s (with
+their `open`, `variable`, `universe`, `set_option`, `omit` and `include`
+commands) in a `section`, and opens the caller's again (`ReplCheck.bridge`).
+One request is one command. At the end of the loop, one `lake build` of the
+changed modules confirms the accepted forms; a failure stops the tool.
 The end is the full check of the def mode, without
 `scripts/update_gate_baseline.py` (the mode changes nothing under
 `scripts/` outside `scripts/codemod/`), and `check.sh --json --base <head>`.
@@ -104,7 +127,7 @@ Not handled (reported as not fixed): `v` or `hv` bound in the statement
   parser for the loop); discovery and the guards; the conversion; the
   dependents in import order through `lake serve`; one full check at the
   end.
-- `DefToStructure/Lsp.lean`: the `lake serve` client. JSON-RPC with
+- `DefToStructure/Lsp.lean`: the `lake serve` client of the def mode. JSON-RPC with
   `Lean.JsonRpc`; `didOpen`/`didChange` with the whole text; `waitIdle`
   returns the diagnostics once `$/lean/fileProgress` reports nothing left for
   the current version. Queries: `textDocument/definition`, and
@@ -123,11 +146,16 @@ Not handled (reported as not fixed): `v` or `hv` bound in the statement
   from file headers.
 - `DefToStructure/Alias.lean`: the alias mode: the in-process elaboration,
   the declaration edits and the call-site edits from the info tree.
+- `DefToStructure/Repl.lean`: the Lean REPL client (one JSON command per
+  request). `DefToStructure/ReplCheck.lean`: the alias mode's check through
+  it (sessions, scopes, the fresh-name check).
 - `Tests.lean`: 55 cases of the decision (the 43 recorded cases of the first
   tool, the silent projection, the parenthesized-receiver goal, the two
   applications under `unfold`, the negation cases and the `Decidable` instances),
-  and 7 alias cases (an implicit argument, a named argument, dot notation,
-  a proof that names `v` and `hv`, the `generalize` form, the two cast forms).
+  9 alias cases (an implicit argument, a named argument, dot notation,
+  a proof that names `v` and `hv`, the `generalize` form, the `suffices`
+  forms, the two cast forms), and the REPL check (a caller in `D`'s scope and
+  one in another scope; a right candidate, a wrong proof, wrong callers).
 - `scope.lean`: scope measurement, `lake env lean scope.lean` in a built
   checkout.
 

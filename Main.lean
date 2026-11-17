@@ -29,6 +29,7 @@ import DefToStructure.Parse
 import DefToStructure.Patterns
 import DefToStructure.Discovery
 import DefToStructure.Alias
+import DefToStructure.ReplCheck
 
 open Lean DefToStructure DefToStructure.Discovery
 
@@ -42,6 +43,8 @@ structure Args where
   resume : Bool
   /-- `--alias WORKLIST.json`: the alias transform (`DefToStructure.Alias`). -/
   alias : Option System.FilePath := none
+  /-- `--repl PATH`: the Lean REPL binary for the alias mode's checks. -/
+  repl : Option System.FilePath := none
 
 def parseArgs (args : List String) : Except String Args := do
   let mut checkout := ""
@@ -50,6 +53,7 @@ def parseArgs (args : List String) : Except String Args := do
   let mut report := ""
   let mut resume := false
   let mut alias := ""
+  let mut repl := ""
   let mut rest := args
   while !rest.isEmpty do
     match rest with
@@ -59,12 +63,15 @@ def parseArgs (args : List String) : Except String Args := do
     | "--report" :: v :: r => report := v; rest := r
     | "--resume" :: r => resume := true; rest := r
     | "--alias" :: v :: r => alias := v; rest := r
+    | "--repl" :: v :: r => repl := v; rest := r
     | a :: _ => throw s!"unknown argument {a}"
     | [] => pure ()
-  if checkout.isEmpty || slot == 0 || (names.isEmpty && alias.isEmpty) || report.isEmpty || (resume && !alias.isEmpty) then
-    throw "usage: def_to_structure --checkout DIR --slot N (--names A,B [--resume] | --alias WORKLIST.json) --report FILE"
+  if checkout.isEmpty || slot == 0 || (names.isEmpty && alias.isEmpty) || report.isEmpty || (resume && !alias.isEmpty)
+      || (!alias.isEmpty && repl.isEmpty) then
+    throw "usage: def_to_structure --checkout DIR --slot N (--names A,B [--resume] | --alias WORKLIST.json --repl REPL) --report FILE"
   return { checkout, slot, names := (names.splitOn ",").map (·.trimAscii.copy) |>.filter (· ≠ "") |>.toArray,
-           report, resume, alias := if alias.isEmpty then none else some alias }
+           report, resume, alias := if alias.isEmpty then none else some alias,
+           repl := if repl.isEmpty then none else some repl }
 
 /-- A stop: the tool changes nothing more and reports `msg`. -/
 structure StopError where
@@ -504,31 +511,21 @@ def buildUpTo (files : Array String) (upto : Nat) (disk built : Std.HashMap Stri
       built := built.insert rel t
   return built
 
-/-- The server's errors for `rel` with `text`: the message and its byte offset. -/
-def serverErrors (c : Lsp.Client) (rel text : String) : M (Array (String × Nat)) := do
-  let uri := Lsp.uriOf (← read).root rel
-  c.open uri text
-  let diags ← c.waitIdle uri
-  c.close uri
-  let fm := FileMap.ofString text
-  return diags.filterMap fun d =>
-    if d.severity? == some .error then
-      some (s!"{rel}:{d.range.start.line + 1}:{d.range.start.character}: {d.message}",
-        (fm.lspPosToUtf8Pos d.range.start).byteIdx)
-    else none
-
 /-- The alias mode (`--alias`), one declaration at a time, the last
     declaration of the last file first (a caller before its callee: the
     caller's arguments are then the right-hand side, not its own variable).
     For each declaration: an in-process elaboration of its file and of every
     file that names it, on their current texts (`Alias.declEdits`,
-    `Alias.callSites`); then each form in turn, its files checked in import
-    order through `lake serve` (an edited module is rebuilt before a file
-    that imports it). The first form without an error stays; with none, the
-    files go back to their texts before the declaration. -/
+    `Alias.callSites`); then each form in turn, checked through the Lean
+    REPL (`ReplCheck`): the new declaration under a fresh name in the
+    environment before it, then each changed command that names it. The
+    first form without an error is written to the files; with none, the
+    files keep their texts. At the end, one `lake build` of the changed
+    modules. -/
 def stepAlias : M Unit := do
   let e ← read
   let some wl := e.args.alias | stop "--alias: no work list"
+  let some replPath := e.args.repl | stop "--alias needs --repl PATH (the Lean REPL)"
   let findings ← match Json.parse (← IO.FS.readFile wl) >>= fun j => do (← j.getArr?).mapM Alias.Finding.ofJson with
     | .ok fs => pure fs
     | .error err => stop s!"the work list is not valid: {err}"
@@ -554,14 +551,18 @@ def stepAlias : M Unit := do
     fileIdx ua.file > fileIdx ub.file || (ua.file == ub.file && ua.line > ub.line)
   log s!"[alias] {units.size} declarations, {files.size} files"
   let home := (← IO.getEnv "HOME").getD ""
-  initSearchPath (← findSysroot s!"{home}/.elan/bin/lean") (← targetSearchPath e.root)
+  let sp ← targetSearchPath e.root
+  initSearchPath (← findSysroot s!"{home}/.elan/bin/lean") sp
   let mut disk : Std.HashMap String String := {}
   for rel in files do disk := disk.insert rel (← IO.FS.readFile (e.root / rel))
-  let c ← Lsp.start e.root (e.logDir / "lsp.log")
+  let c ← Repl.start replPath sp (e.logDir / "repl.log")
+  let secs (t0 : Nat) : IO Float := do return (Float.ofNat ((← IO.monoMsNow) - t0)) / 1000.0
   let result ← tryCatch (do
     let mut units := units
     let mut disk := disk
     let mut built := disk
+    let mut sessions : Std.HashMap String ReplCheck.Session := {}
+    let mut changedFiles : Array String := #[]
     -- a second pass retries each declaration that failed on a form: the
     -- declarations accepted after it can change its callers and callees
     for (ui, k) in (order ++ order).zipIdx do
@@ -574,7 +575,7 @@ def stepAlias : M Unit := do
       let elabFile (rel : String) : M Alias.FileElab := do
         let t0 ← IO.monoMsNow
         let fe ← Alias.elabText (e.root / rel).toString (moduleName rel) (disk.getD rel "")
-        log s!"[alias]   elaborated {rel} in {((← IO.monoMsNow) - t0) / 1000}s"
+        log s!"[alias]   elaborated {rel} in {← secs t0}s"
         unless fe.errors.isEmpty do stop s!"{rel} has errors before the edit: {fe.errors[0]!}"
         return fe
       let fe ← elabFile u.file
@@ -585,23 +586,38 @@ def stepAlias : M Unit := do
           e.aliasReport.set (aliasResults units)
           continue
       let skip := ((Alias.declCommand? fe u.decl).bind Alias.rng?).getD (0, 0)
-      let pairs := de.pairs.map fun p => (p.v, p.hv)
-      let mut sites : Array (String × Alias.Sites) := #[]
+      let pairs := de.pairs.map (·.site)
+      -- each file's call sites: the edits for the disk and the edits for the check
+      let mut sites : Array (String × Alias.Sites × Alias.Sites) := #[]
+      let mut elabs : Array (String × Alias.FileElab) := #[(u.file, fe)]
       let mut problem : Option String := none
       for rel in uFiles do
         let fe' ← if rel == u.file then pure fe else do
           built ← buildUpTo files (fileIdx rel) disk built
           elabFile rel
         unless fe'.env.contains u.decl do continue
-        let s ← Alias.callSites fe' u.decl pairs (if rel == u.file then skip else (0, 0))
+        let sk := if rel == u.file then skip else (0, 0)
+        let s ← Alias.callSites fe' u.decl pairs sk "" de.moved
+        let sc ← Alias.callSites fe' u.decl pairs sk ReplCheck.suffix de.moved
         if let some pr := s.problem then problem := some s!"{rel}:{pr}"
         if !s.argCasts.isEmpty && (rel.startsWith "ArmadaLean/Spec/" || rel.startsWith "ArmadaLean/Lint/") then
           problem := some s!"{rel}: a call site is under ArmadaLean/Spec/ or ArmadaLean/Lint/"
-        sites := sites.push (rel, s)
+        sites := sites.push (rel, s, sc)
+        if rel != u.file then elabs := elabs.push (rel, fe')
       if let some pr := problem then
         units := units.set! ui { u with attempts := #[("analysis", pr)] }
         e.aliasReport.set (aliasResults units)
         continue
+      -- the REPL sessions of the declaration's file and of the files with a changed command
+      for (rel, fe') in elabs do
+        unless rel == u.file || sites.any (fun (r, _, sc) => r == rel && !sc.argCasts.isEmpty) do continue
+        let t0 ← IO.monoMsNow
+        let (sess, errs) ← ReplCheck.sync c rel fe' sessions[rel]?
+        log s!"[alias]   REPL session {rel} ({sess.ranges.size} chunks) in {← secs t0}s"
+        unless errs.isEmpty do stop s!"{rel} has errors in the REPL before the edit: {errs[0]!}"
+        sessions := sessions.insert rel sess
+      let some dSess := sessions[u.file]? | stop s!"{u.file}: no REPL session"
+      let some dIdx := dSess.chunkAt skip.1 | stop s!"{u.decl}: no REPL chunk"
       -- the proof forms, in order
       let mut attempts : Array (String × String) := u.attempts
       let mut proofForms : Array (String × Array Edit) := #[]
@@ -611,72 +627,90 @@ def stepAlias : M Unit := do
         | .error msg => attempts := attempts.push ("proof substituted", msg)
       if let some r := de.restated then proofForms := proofForms.push ("proof behind suffices", #[r])
       if let some p := de.preamble then proofForms := proofForms.push ("proof behind generalize", #[p])
-      let castsDiffer := sites.any fun (_, s) => s.argCasts != s.callCast
-      let callForms : Array String := if castsDiffer then #["argument casts", "call cast"] else #["plain calls"]
-      let mut accepted : Option (String × Array String) := none
-      -- an error in the declaration's own command moves to the next proof
-      -- form; an error at a call site moves to the next call-site form
+      let castsDiffer := sites.any fun (_, s, _) => s.argCasts != s.callCast
+      let mut callForms : Array String := if castsDiffer then #["argument casts", "call cast"] else #["plain calls"]
+      match sites.findSome? fun (rel, s, _) => match s.rewriteCasts with | .error m => some s!"{rel}:{m}" | .ok _ => none with
+      | some m => attempts := attempts.push ("rewrite casts", m)
+      | none =>
+        if sites.any fun (_, s, _) => s.rewriteCasts.toOption != some s.argCasts then
+          callForms := callForms.push "rewrite casts"
+      let rename : Edit := { start := de.declIdEnd, stop := de.declIdEnd, replacement := ReplCheck.suffix }
+      let stubValue : Edit := { start := de.valueRange.1, stop := de.valueRange.2, replacement := ":= sorry" }
+      let mut accepted : Option String := none
+      -- an error in the declaration moves to the next proof form; an error
+      -- in a caller moves to the next call-site form
       let mut pi := 0
       let mut ci := 0
       while accepted.isNone && pi < proofForms.size && ci < callForms.size do
         let (pf, peds) := proofForms[pi]!
         let cf := callForms[ci]!
         let form := s!"{pf}, {cf}"
-        -- the texts of this form
-        let mut texts : Array (String × String × Array Edit) := #[]
+        let pick (s : Alias.Sites) : Array Edit :=
+          if cf == "call cast" then s.callCast
+          else if cf == "rewrite casts" then s.rewriteCasts.toOption.getD #[]
+          else s.argCasts
+        -- the texts of this form, and the commands of its check
+        let mut texts : Array (String × String) := #[]
         let mut bad : Option String := none
         for rel in uFiles do
           let call := match sites.find? (·.1 == rel) with
-            | some (_, s) => if cf == "call cast" then s.callCast else s.argCasts
+            | some (_, s, _) => pick s
             | none => #[]
           let own := if rel == u.file then de.sig ++ peds else #[]
           match Alias.nest (call ++ own) with
-          | .ok eds => texts := texts.push (rel, applyEdits (disk.getD rel "") eds, eds)
+          | .ok eds => texts := texts.push (rel, applyEdits (disk.getD rel "") eds)
           | .error msg => bad := some s!"{rel}: {msg}"
+        let dEdits := Alias.nest (de.sig ++ peds ++ #[rename])
+        let dStubEdits := Alias.nest (de.sig ++ #[rename, stubValue])
+        let (dEdits, dStubEdits) ← match dEdits, dStubEdits with
+          | .ok a, .ok b => pure (a, b)
+          | .error msg, _ | _, .error msg => bad := some s!"{u.file}: {msg}"; pure (#[], #[])
         if let some msg := bad then
           attempts := attempts.push (form, msg)
           pi := pi + 1
           continue
-        -- the check, file by file
-        let before := disk
-        let mut failure : Option (String × Array (String × Nat) × Array Edit) := none
-        for (rel, text, eds) in texts do
-          if text != disk.getD rel "" then
-            checkForbidden (disk.getD rel "") text rel
-            writeFile rel text
-            disk := disk.insert rel text
-          built ← buildUpTo files (fileIdx rel) disk built
-          log s!"[alias]   checking {rel} ({form})"
-          let errs ← serverErrors c rel text
-          unless errs.isEmpty do
-            failure := some (rel, errs, eds)
-            break
-        match failure with
-        | none =>
-          accepted := some (form, (texts.filter fun (rel, t, _) => t != before.getD rel "").map (·.1))
-        | some (rel, errs, eds) =>
-          log s!"[alias]   {form}: {errs.size} errors, the first: {errs[0]!.1.take 300}"
-          for (rel, _, _) in texts do
-            let t := before.getD rel ""
-            if disk.getD rel "" != t then
+        let dText := dSess.editedChunk dIdx dEdits
+        let dStub := if de.isTheorem then dSess.editedChunk dIdx dStubEdits else dText
+        let mut callers : Array (ReplCheck.Session × Nat × String) := #[]
+        for (rel, _, sc) in sites do
+          let some sess := sessions[rel]? | continue
+          let ceds := pick sc
+          for i in sess.touched ceds do
+            unless rel == u.file && i == dIdx do callers := callers.push (sess, i, sess.editedChunk i ceds)
+        let t0 ← IO.monoMsNow
+        let (declErrs, callErrs) ← ReplCheck.check c dSess dIdx dText dStub callers
+        log s!"[alias]   checked {form}: the declaration and {callers.size} commands in {← secs t0}s"
+        if declErrs.isEmpty && callErrs.isEmpty then
+          let changed := (texts.filter fun (rel, t) => t != disk.getD rel "").map (·.1)
+          for (rel, t) in texts do
+            if t != disk.getD rel "" then
+              checkForbidden (disk.getD rel "") t rel
               writeFile rel t
               disk := disk.insert rel t
-          let shift (o : Nat) : Nat := eds.foldl (init := o) fun acc ed =>
-            if ed.stop ≤ o then acc + ed.replacement.utf8ByteSize - (ed.stop - ed.start) else acc
-          let inDecl (o : Nat) : Bool := rel == u.file && shift skip.1 ≤ o && o ≤ shift skip.2
-          match errs.find? (!inDecl ·.2) with
-          | some (m, _) =>
-            log s!"[alias]   at a call site: {m.take 600}"
-            attempts := attempts.push (form, s!"at a call site: {m}")
-          | none => attempts := attempts.push (form, errs[0]!.1)
-          if errs.any (inDecl ·.2) then pi := pi + 1
-          if errs.any (!inDecl ·.2) then ci := ci + 1
+          accepted := some form
+          units := units.set! ui { u with form := some form, files := changed, attempts }
+          for rel in changed do
+            unless changedFiles.contains rel do changedFiles := changedFiles.push rel
+          -- a session after the first changed file imports a changed module: it starts again
+          let m := changed.foldl (fun acc rel => min acc (fileIdx rel)) files.size
+          sessions := sessions.filter fun rel _ => fileIdx rel ≤ m
+        else
+          log s!"[alias]   {form}: {(declErrs ++ callErrs)[0]!.take 300}"
+          match callErrs[0]? with
+          | some m => attempts := attempts.push (form, s!"at a call site: {m}")
+          | none => attempts := attempts.push (form, declErrs[0]!)
+          if !declErrs.isEmpty then pi := pi + 1
+          if !callErrs.isEmpty then ci := ci + 1
       match accepted with
-      | some (form, fs) =>
-        log s!"[alias]   fixed: {form}"
-        units := units.set! ui { u with form := some form, files := fs, attempts }
+      | some form => log s!"[alias]   fixed: {form}"
       | none => units := units.set! ui { u with attempts }
       e.aliasReport.set (aliasResults units)
+    -- the real check of the REPL's verdicts: one build of the changed modules
+    let mods := changedFiles.filter (·.startsWith "ArmadaLean") |>.map fun rel => (moduleName rel).toString
+    unless mods.isEmpty do
+      let p ← runCmd (#["lake", "build"] ++ mods) "build-alias-changed.log"
+      if p.exitCode != 0 then
+        stop s!"lake build of the changed modules failed after the REPL accepted them:\n{(tail (p.stdout ++ p.stderr) 3000)}"
     pure (Except.ok ()))
     (fun err => pure (Except.error err))
   c.stop
