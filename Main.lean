@@ -595,7 +595,7 @@ def stepAlias : M Unit := do
         unless fe'.env.contains u.decl do continue
         let s ← Alias.callSites fe' u.decl pairs (if rel == u.file then skip else (0, 0))
         if let some pr := s.problem then problem := some s!"{rel}:{pr}"
-        if !s.edits.isEmpty && (rel.startsWith "ArmadaLean/Spec/" || rel.startsWith "ArmadaLean/Lint/") then
+        if !s.argCasts.isEmpty && (rel.startsWith "ArmadaLean/Spec/" || rel.startsWith "ArmadaLean/Lint/") then
           problem := some s!"{rel}: a call site is under ArmadaLean/Spec/ or ArmadaLean/Lint/"
         sites := sites.push (rel, s)
       if let some pr := problem then
@@ -609,20 +609,33 @@ def stepAlias : M Unit := do
       else match de.proof with
         | .ok eds => proofForms := proofForms.push ("proof substituted", eds)
         | .error msg => attempts := attempts.push ("proof substituted", msg)
+      if let some r := de.restated then proofForms := proofForms.push ("proof behind suffices", #[r])
       if let some p := de.preamble then proofForms := proofForms.push ("proof behind generalize", #[p])
+      let castsDiffer := sites.any fun (_, s) => s.argCasts != s.callCast
+      let callForms : Array String := if castsDiffer then #["argument casts", "call cast"] else #["plain calls"]
       let mut accepted : Option (String × Array String) := none
-      for (form, peds) in proofForms do
+      -- an error in the declaration's own command moves to the next proof
+      -- form; an error at a call site moves to the next call-site form
+      let mut pi := 0
+      let mut ci := 0
+      while accepted.isNone && pi < proofForms.size && ci < callForms.size do
+        let (pf, peds) := proofForms[pi]!
+        let cf := callForms[ci]!
+        let form := s!"{pf}, {cf}"
         -- the texts of this form
         let mut texts : Array (String × String × Array Edit) := #[]
         let mut bad : Option String := none
         for rel in uFiles do
-          let call := ((sites.find? (·.1 == rel)).map (·.2.edits)).getD #[]
+          let call := match sites.find? (·.1 == rel) with
+            | some (_, s) => if cf == "call cast" then s.callCast else s.argCasts
+            | none => #[]
           let own := if rel == u.file then de.sig ++ peds else #[]
           match Alias.nest (call ++ own) with
           | .ok eds => texts := texts.push (rel, applyEdits (disk.getD rel "") eds, eds)
           | .error msg => bad := some s!"{rel}: {msg}"
         if let some msg := bad then
           attempts := attempts.push (form, msg)
+          pi := pi + 1
           continue
         -- the check, file by file
         let before := disk
@@ -641,24 +654,23 @@ def stepAlias : M Unit := do
         match failure with
         | none =>
           accepted := some (form, (texts.filter fun (rel, t, _) => t != before.getD rel "").map (·.1))
-          break
         | some (rel, errs, eds) =>
-          log s!"[alias]   {form}: {errs[0]!.1.take 300}"
+          log s!"[alias]   {form}: {errs.size} errors, the first: {errs[0]!.1.take 300}"
           for (rel, _, _) in texts do
             let t := before.getD rel ""
             if disk.getD rel "" != t then
               writeFile rel t
               disk := disk.insert rel t
-          -- an error outside the declaration's own command is at a call
-          -- site: no proof form changes it
           let shift (o : Nat) : Nat := eds.foldl (init := o) fun acc ed =>
             if ed.stop ≤ o then acc + ed.replacement.utf8ByteSize - (ed.stop - ed.start) else acc
           let inDecl (o : Nat) : Bool := rel == u.file && shift skip.1 ≤ o && o ≤ shift skip.2
           match errs.find? (!inDecl ·.2) with
           | some (m, _) =>
+            log s!"[alias]   at a call site: {m.take 600}"
             attempts := attempts.push (form, s!"at a call site: {m}")
-            break
           | none => attempts := attempts.push (form, errs[0]!.1)
+          if errs.any (inDecl ·.2) then pi := pi + 1
+          if errs.any (!inDecl ·.2) then ci := ci + 1
       match accepted with
       | some (form, fs) =>
         log s!"[alias]   fixed: {form}"

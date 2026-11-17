@@ -399,7 +399,7 @@ compares the text, and elaborates the result: it must have no error. -/
 
 /-- The proof form of a case. -/
 inductive ProofForm where
-  | unchanged | substituted | generalized
+  | unchanged | substituted | restated | generalized
 
 structure AliasCase where
   name : String
@@ -407,6 +407,8 @@ structure AliasCase where
   decl : Name
   binders : Array String
   proof : ProofForm
+  /-- The `callCast` call-site form; else `argCasts`. -/
+  callCast : Bool := false
   want : String
 
 def fooSrc (use : String) : String :=
@@ -434,9 +436,21 @@ def aliasCases : List AliasCase := [
     src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
     proof := .generalized,
     want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  generalize hb : (a + 1) = b at h ⊢; replace hb := hb.symm; subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
-  { name := "a caller with its own variable for v: the call gets a cast",
+  { name := "the proof kept behind `suffices` over v, hv and the binders that name v",
+    src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
+    proof := .restated,
+    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  suffices hAlias : ∀ (b : Nat) (hb : b = a + 1) (h : 0 < b), b ≠ 0 from hAlias _ rfl h; intro b hb h; subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
+  { name := "v and hv in the statement (`∀ n W, W.length = n → …`), the proof behind `suffices`",
+    src := "theorem topo : ∀ n (W : List Nat), W.length = n → W.length ≤ n := by\n  intro n\n  induction n with\n  | zero => intro W h; omega\n  | succ k ih => intro W h; omega\n\ntheorem useT (W : List Nat) : W.length ≤ W.length := topo _ W rfl\n",
+    decl := `topo, binders := #["n"], proof := .restated,
+    want := "theorem topo : ∀ (W : List Nat), W.length ≤ W.length := by\n  suffices hAlias : ∀ n (W : List Nat), W.length = n → W.length ≤ n from (by intro hAlias_1; exact hAlias _ hAlias_1 rfl); intro n\n  induction n with\n  | zero => intro W h; omega\n  | succ k ih => intro W h; omega\n\ntheorem useT (W : List Nat) : W.length ≤ W.length := topo W\n" },
+  { name := "a caller with its own variable for v: argument casts",
     src := bazSrc "theorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := baz 2 k hk h\n", decl := `baz,
     binders := #["b"], proof := .substituted,
+    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := (hk ▸ baz 2 (hk ▸ h))\n" },
+  { name := "a caller with its own variable for v: a call cast",
+    src := bazSrc "theorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := baz 2 k hk h\n", decl := `baz,
+    binders := #["b"], proof := .substituted, callCast := true,
     want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := (by obtain rfl := hk; exact (baz 2 h))\n" } ]
 
 def runAliasCase (c : AliasCase) : IO Bool := do
@@ -457,12 +471,13 @@ def runAliasCase (c : AliasCase) : IO Bool := do
       return false
     let proof ← match c.proof, de.proof with
       | .unchanged, _ => pure #[]
+      | .restated, _ => pure de.restated.toArray
       | .generalized, _ => pure de.preamble.toArray
       | .substituted, .ok eds => pure eds
       | .substituted, .error msg => do
         IO.println s!"FAIL {c.name}: {msg}"
         return false
-    let edits := de.sig ++ proof ++ sites.edits
+    let edits := de.sig ++ proof ++ (if c.callCast then sites.callCast else sites.argCasts)
     let got := applyEdits c.src edits
     unless got == c.want do
       IO.println s!"FAIL {c.name}:\n--- got\n{got}--- want\n{c.want}"

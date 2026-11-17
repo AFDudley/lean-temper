@@ -68,20 +68,25 @@ error stays):
 | behind `generalize` | the first tactic gets `generalize hv : rhs = v at h₁ … ⊢; replace hv := hv.symm;` (`replace` only for `v = rhs`; `h₁ …` are the binders whose types named `v`); a term proof becomes `by <that>exact <term>`. `generalize` also abstracts the occurrences of `rhs` that the statement had itself |
 
 A call site loses the two arguments. When the caller passes its own term
-for `v` (see the table above), the call also gets a cast with the `hv`
-argument `h`: `(by obtain rfl := h; exact (D …))` for a local variable, else
-`(h ▸ D …)`.
+for `v` (see the table above), the call also gets casts with the `hv`
+argument `h`. Call-site forms, in this order:
+
+| call-site form | edit |
+|----------------|------|
+| argument casts | each other argument whose binder type names `v` becomes `(h ▸ a)`; the call becomes `(h ▸ D …)` when its type names `v` |
+| call cast | `(by obtain rfl := h; exact (D …))` when the `v` argument is a local variable, else `(h ▸ D …)` |
 
 Loop (`stepAlias`): one declaration at a time, the last declaration of the
 last file first. A caller then comes before its callee, so the caller's
 arguments are already `rhs`, not its own variable. For each declaration:
 the analysis of its file and of every file that names it, on their current
-texts; then each proof form, its files written and checked in import order
-through `lake serve`. An error outside the declaration's own command is at
-a call site, and ends the declaration's forms. A module is rebuilt
-(`lake build <Module>`) before a file that imports it is elaborated or
-checked. With no form left, the files go back to their texts before the
-declaration. A second pass retries each declaration that failed on a form.
+texts; then the forms, their files written and checked in import order
+through `lake serve`. An error in the declaration's own command moves to
+the next proof form; an error elsewhere is at a call site and moves to the
+next call-site form. A module is rebuilt (`lake build <Module>`) before a
+file that imports it is elaborated or checked. With no form left, the files
+go back to their texts before the declaration. A second pass retries each
+declaration that failed on a form.
 The end is the full check of the def mode, without
 `scripts/update_gate_baseline.py` (the mode changes nothing under
 `scripts/` outside `scripts/codemod/`), and `check.sh --json --base <head>`.
@@ -121,8 +126,8 @@ Not handled (reported as not fixed): `v` or `hv` bound in the statement
 - `Tests.lean`: 55 cases of the decision (the 43 recorded cases of the first
   tool, the silent projection, the parenthesized-receiver goal, the two
   applications under `unfold`, the negation cases and the `Decidable` instances),
-  and 6 alias cases (an implicit argument, a named argument, dot notation,
-  a proof that names `v` and `hv`, the `generalize` form, a call with a cast).
+  and 7 alias cases (an implicit argument, a named argument, dot notation,
+  a proof that names `v` and `hv`, the `generalize` form, the two cast forms).
 - `scope.lean`: scope measurement, `lake env lean scope.lean` in a built
   checkout.
 

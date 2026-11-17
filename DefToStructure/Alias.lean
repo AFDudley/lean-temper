@@ -185,6 +185,7 @@ def declParts? (cmd : Syntax) : Option DeclParts := do
 structure Pair where
   finding : Finding
   v : String
+  /-- `hv`'s name; empty for a premise `v = rhs →` of the statement. -/
   hv : String
   /-- `true` for `hv : v = rhs`, `false` for `hv : rhs = v`. -/
   vLeft : Bool
@@ -192,17 +193,28 @@ structure Pair where
   vIds : Array FVarId
   hvIds : Array FVarId
   vIdent : Syntax
-  vGroup : Group
-  hvGroup : Group
+  /-- `v`'s binder group in the declaration; none for a `∀` binder of the statement. -/
+  vGroup : Option Group
+  /-- `hv`'s binder group in the declaration; none for a premise of the statement. -/
+  hvGroup : Option Group
+  /-- The ranges that go in the statement: `v`'s `∀` binder, `hv`'s premise. -/
+  stmtDel : Array (Nat × Nat)
+
+/-- `v` or `hv` is part of the statement, not a binder of the declaration. -/
+def Pair.inStatement (p : Pair) : Bool := p.vGroup.isNone || p.hvGroup.isNone
 
 /-- The edits of one declaration. `sig`: the binder deletions and the
-    substitutions in the signature. The proof has two forms: `proof`, the
+    substitutions in the signature. The proof has three forms: `proof`, the
     occurrences of `v` and `hv` in the proof replaced (`v` by `rhs`, a
-    rewrite or `subst` with `hv` deleted, another `hv` by `rfl`); and
-    `preamble`, the proof text kept behind `generalize`. -/
+    rewrite or `subst` with `hv` deleted, another `hv` by `rfl`);
+    `restated`, the proof text kept behind
+    `suffices h : ∀ (v : T) (hv : v = rhs) (h₁ : T₁ v) …, OLD from h _ rfl h₁ …; intro v hv h₁ …`
+    (the context and the goal of the old proof exactly); and `preamble`,
+    the proof text kept behind `generalize`. -/
 structure DeclEdits where
   sig : Array Edit
   proof : Except String (Array Edit)
+  restated : Option Edit
   preamble : Option Edit
   /-- The proof names `v` or `hv`. -/
   proofNames : Bool
@@ -230,33 +242,66 @@ def declCommand? (fe : FileElab) (d : Name) : Option Syntax := do
     | some (s, e) => s ≤ n.start && n.stop ≤ e
     | none => false
 
-/-- Find the pair for binder `v` among `parts`, from the info tree. -/
+partial def descendants (stx : Syntax) (acc : Array Syntax := #[]) : Array Syntax :=
+  stx.getArgs.foldl (init := acc.push stx) fun acc c => descendants c acc
+
+/-- Find the pair for binder `v`, from the info tree: `v` is a binder of
+    the declaration or of a `∀` in the statement; `hv` is a later binder of
+    the declaration or a premise `v = rhs →` of the statement. -/
 def findPair (fe : FileElab) (ns : Array Node) (parts : DeclParts) (f : Finding) : Except String Pair := do
-  let some (gi, vIdent) := parts.groups.zipIdx.findSome? fun (g, gi) =>
-      (g.idents.find? fun i => identName i == f.binder).map (gi, ·)
-    | throw s!"`{f.binder}` is bound in the statement, not by a binder of the declaration"
+  let declHit := parts.groups.zipIdx.findSome? fun (g, gi) =>
+    (g.idents.find? fun i => identName i == f.binder).map (gi, ·)
+  let typeNodes := descendants parts.type
+  -- `v`: its identifier, its group, and the statement range that goes
+  let (vIdent, vGi?, vStmtDel) ← match declHit with
+    | some (gi, i) => pure (i, some gi, #[])
+    | none =>
+      let hit := typeNodes.findSome? fun fa => do
+        guard (fa.isOfKind ``Parser.Term.forall)
+        let bs := fa[1].getArgs
+        bs.findSome? fun b =>
+          let g : Group := if b.isIdent then { stx := b, idents := #[b], type? := none } else groupOf b
+          (g.idents.find? (identName · == f.binder)).bind fun i => do
+            if bs.size == 1 && g.idents.size == 1 then
+              let (s, _) ← rng? fa
+              let (_, e) ← rng? fa[3]
+              pure (i, (s, e))
+            else if g.idents.size == 1 then pure (i, ← rng? g.stx)
+            else pure (i, ← rng? i)
+      match hit with
+      | some (i, r) => pure (i, none, #[r])
+      | none => throw s!"no binder `{f.binder}` in the declaration or its statement"
   let some vr := rng? vIdent | throw "the binder has no source range"
   let vIds := fvarsAt ns vr true
   if vIds.isEmpty then throw s!"no binder node for `{f.binder}`"
   let isV (stx : Syntax) : Bool := match rng? stx with
     | some r => stx.isIdent && (fvarsAt ns r false).any vIds.contains
     | none => false
-  let mut found : Option Pair := none
-  for g in parts.groups.extract (gi + 1) parts.groups.size do
-    let some t := g.type? | continue
-    unless g.idents.size == 1 && t.isOfKind ``«term_=_» do continue
-    let (lhs, rhs) := (t[0], t[2])
-    let some (vLeft, side) := (if isV lhs then some (true, rhs) else if isV rhs then some (false, lhs) else none)
-      | continue
-    let some (ss, se) := rng? side | continue
-    let some hr := rng? g.idents[0]! | continue
-    found := some { finding := f, v := f.binder, hv := identName g.idents[0]!, vLeft,
-                    rhsText := if atomic side then slice fe.text ss se else s!"({slice fe.text ss se})",
-                    vIds, hvIds := fvarsAt ns hr true, vIdent, vGroup := parts.groups[gi]!, hvGroup := g }
-    break
-  match found with
-  | some p => return p
-  | none => throw s!"the equation for `{f.binder}` is a premise of the statement, not a binder of the declaration"
+  let sides (t : Syntax) : Option (Bool × Syntax) :=
+    if !t.isOfKind ``«term_=_» then none
+    else if isV t[0] then some (true, t[2]) else if isV t[2] then some (false, t[0]) else none
+  let rhsOf (side : Syntax) : Except String String := do
+    let some (ss, se) := rng? side | throw "no range"
+    return if atomic side then slice fe.text ss se else s!"({slice fe.text ss se})"
+  let base : Pair := { finding := f, v := f.binder, hv := "", vLeft := true, rhsText := "", vIds, hvIds := #[],
+                       vIdent, vGroup := vGi?.map (parts.groups[·]!), hvGroup := none, stmtDel := vStmtDel }
+  -- `hv`: a later binder of the declaration
+  if let some gi := vGi? then
+    for g in parts.groups.extract (gi + 1) parts.groups.size do
+      let some t := g.type? | continue
+      unless g.idents.size == 1 do continue
+      let some (vLeft, side) := sides t | continue
+      let some hr := rng? g.idents[0]! | continue
+      return { base with hv := identName g.idents[0]!, vLeft, rhsText := ← rhsOf side,
+                         hvIds := fvarsAt ns hr true, hvGroup := some g }
+  -- `hv`: a premise of the statement
+  for a in typeNodes do
+    unless a.isOfKind ``Parser.Term.arrow do continue
+    let some (vLeft, side) := sides a[0] | continue
+    let some (s, _) := rng? a[0] | continue
+    let some (_, e) := rng? a[1] | continue
+    return { base with vLeft, rhsText := ← rhsOf side, stmtDel := vStmtDel.push (s, e) }
+  throw s!"no equation `{f.binder} = …` among the binders and premises"
 
 /-- The proof's first tactic, or the term, and whether it is a tactic block. -/
 def proofStart? (value : Syntax) : Option (Syntax × Bool) := do
@@ -398,6 +443,33 @@ def nest (edits : Array Edit) : Except String (Array Edit) := do
     | none => out := out.push ed
   return out
 
+/-- The binder names of `d`'s type, in order (implicit ones included). -/
+def binderNames (env : Environment) (d : Name) : Option (Array Name) := do
+  let ci ← env.find? d
+  let rec go (t : Expr) (acc : Array Name) (fuel : Nat) : Array Name :=
+    match fuel, t with
+    | fuel + 1, .forallE n _ b _ => go b (acc.push n) fuel
+    | _, _ => acc
+  pure (go ci.type #[] 10000)
+
+/-- The binder types of a `∀` telescope (with loose bound variables) and
+    the type after `n` binders. -/
+def telescope (t : Expr) (n : Nat) : Array Expr × Expr := Id.run do
+  let mut t := t
+  let mut doms := #[]
+  for _ in [0:n] do
+    let .forallE _ d b _ := t | break
+    doms := doms.push d
+    t := b
+  return (doms, t)
+
+/-- The index of `hv` in a telescope: the first binder after `after` whose
+    type is an equation with the bound variable of binder `iv` as one side. -/
+def eqIndexAfter (doms : Array Expr) (after iv : Nat) : Option Nat :=
+  (List.range doms.size).find? fun k =>
+    k > after && k > iv && (doms[k]!.isAppOfArity ``Eq 3) &&
+      (doms[k]!.getArg! 1 == .bvar (k - 1 - iv) || doms[k]!.getArg! 2 == .bvar (k - 1 - iv))
+
 /-- The declaration edits for all pairs of one declaration. -/
 def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String DeclEdits := do
   let some cmd0 := declCommand? fe d | throw s!"{d} has no declaration command in its file"
@@ -421,8 +493,10 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
         let some r := rng? i | throw "no range"
         del := del.push r
   for p in pairs do
-    let some hr := rng? p.hvGroup.stx | throw "no range"
-    del := del.push hr
+    if let some g := p.hvGroup then
+      let some hr := rng? g.stx | throw "no range"
+      del := del.push hr
+    del := del ++ p.stmtDel
   let inDel (s e : Nat) := del.any fun (a, b) => a ≤ s && e ≤ b
   let userBound : Std.HashSet FVarId := ns.foldl (init := {}) fun s n =>
     if n.ti.isBinder then match n.ti.expr.consumeMData with
@@ -439,8 +513,8 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
     -- that the proof binds itself has a binder node
     let refersTo (ids : Array FVarId) (name : String) (n : Node) : Bool :=
       !n.ti.isBinder && match n.ti.expr.consumeMData with
-        | .fvar id => ids.contains id ||
-          (!userBound.contains id && (n.ti.lctx.find? id).any (·.userName.eraseMacroScopes.toString == name))
+        | .fvar id => ids.contains id || (name != "" &&
+          !userBound.contains id && (n.ti.lctx.find? id).any (·.userName.eraseMacroScopes.toString == name))
         | _ => false
     let occ := ns.filter (refersTo p.vIds p.v)
     let hvOcc := ns.filter (refersTo p.hvIds p.hv)
@@ -471,7 +545,11 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
               unless hyps.contains (identName i) do hyps := hyps.push (identName i)
     atHyps := atHyps.push hyps
   let sig := deletions fe.text del ++ subst
+  let inStatement := pairs.any (·.inStatement)
+  -- the statement's own binders change the proof's `intro`s: only `restated` keeps the proof
+  if inStatement then proof := .error "`v` or `hv` is part of the statement: the proof's `intro`s depend on them"
   let preamble : Option Edit := Id.run do
+    if inStatement then return none
     let some (start, tactic) := proofStart? parts.value | return none
     let some (ps, _) := rng? start | return none
     let mut text := ""
@@ -480,44 +558,111 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
       text := text ++ s!"generalize {p.hv} : {p.rhsText} = {p.v}{loc}; "
       if p.vLeft then text := text ++ s!"replace {p.hv} := {p.hv}.symm; "
     return some { start := ps, stop := ps, replacement := if tactic then text else s!"by {text}exact " }
-  return { sig, proof := proof >>= nest, preamble, proofNames := names, pairs }
+  -- `suffices`: the old statement over `v`, `hv` and the binders whose types
+  -- name `v`, proved by the old proof; one line before the first tactic
+  let restated : Option Edit := Id.run do
+    let some (start, true) := proofStart? parts.value | return none
+    let some (ps, _) := rng? start | return none
+    let some (ts, te) := rng? parts.type | return none
+    let typeText := slice fe.text ts te
+    if (typeText.splitOn "--").length > 1 then return none
+    let cmdText := slice fe.text cs ce
+    let h := if (cmdText.splitOn "hAlias").length > 1 then "hAlias'" else "hAlias"
+    let mut binders : Array String := #[]
+    let mut args : Array String := #[]
+    let mut intros : Array String := #[]
+    for g in parts.groups do
+      let some (gs, ge) := rng? g.stx | continue
+      let some t := g.type? | continue
+      let some (tts, tte) := rng? t | continue
+      let tText := slice fe.text tts tte
+      if let some p := pairs.find? (fun p => p.hvGroup.any (rng? ·.stx == some (gs, ge))) then
+        binders := binders.push s!"({p.hv} : {tText})"
+        args := args.push "rfl"
+        intros := intros.push p.hv
+        continue
+      for i in g.idents do
+        if pairs.any (fun p => p.vGroup.isSome && rng? p.vIdent == rng? i) then
+          binders := binders.push s!"({identName i} : {tText})"
+          args := args.push "_"
+          intros := intros.push (identName i)
+      if subst.any (fun ed => gs ≤ ed.start && ed.stop ≤ ge) then
+        if g.idents.isEmpty || g.idents.any (!·.isIdent) then return none
+        let ns := g.idents.map identName
+        binders := binders.push s!"({" ".intercalate ns.toList} : {tText})"
+        args := args ++ ns
+        intros := intros ++ ns
+    -- the statement's binders up to its last `hv`: introduced, then passed on
+    let stmt := pairs.filter (·.hvGroup.isNone)
+    let mut fromTerm := s!"{h} {" ".intercalate args.toList}"
+    unless stmt.isEmpty do
+      let some ci := fe.env.find? d | return none
+      let names := ((binderNames fe.env d).getD #[]).map (·.eraseMacroScopes.toString (escape := false))
+      let doms := (telescope ci.type names.size).1
+      -- the position after the declaration's binders
+      let mut m := 0
+      for nm in parts.groups.flatMap (·.idents.map identName) do
+        while m < names.size && names[m]! != nm do m := m + 1
+        m := m + 1
+      let mut ivs : Array Nat := #[]
+      let mut ihs : Array Nat := #[]
+      for p in stmt do
+        let iv? := if p.vGroup.isSome then names.idxOf? p.v
+          else (List.range names.size).find? fun k => k ≥ m && names[k]! == p.v
+        let some iv := iv? | return none
+        let some ih := eqIndexAfter doms (max iv (m - 1)) iv | return none
+        if p.vGroup.isNone then ivs := ivs.push iv
+        ihs := ihs.push ih
+      let top := ihs.foldl max 0
+      let mut xs : Array String := #[]
+      let mut sargs : Array String := #[]
+      for k in [m:top + 1] do
+        if ihs.contains k then sargs := sargs.push "rfl"
+        else if ivs.contains k then sargs := sargs.push "_"
+        else
+          xs := xs.push s!"{h}_{k - m}"
+          sargs := sargs.push s!"{h}_{k - m}"
+      let call := s!"{h} {" ".intercalate (args ++ sargs).toList}"
+      fromTerm := if xs.isEmpty then s!"({call})" else s!"(by intro {" ".intercalate xs.toList}; exact {call})"
+    let quant := if binders.isEmpty then "" else s!"∀ {" ".intercalate binders.toList}, "
+    let introPart := if intros.isEmpty then "" else s!"intro {" ".intercalate intros.toList}; "
+    let text := s!"suffices {h} : {quant}{typeText} from {fromTerm}; {introPart}"
+    -- one line: the line breaks of the copied texts become spaces
+    let oneLine := " ".intercalate ((text.splitOn "\n").map (·.trimAsciiStart.copy))
+    return some { start := ps, stop := ps, replacement := oneLine }
+  return { sig, proof := proof >>= nest, preamble, restated, proofNames := names, pairs }
 
 -- --- call sites ------------------------------------------------------------------
-
-/-- The binder names of `d`'s type, in order (implicit ones included). -/
-def binderNames (env : Environment) (d : Name) : Option (Array Name) := do
-  let ci ← env.find? d
-  let rec go (t : Expr) (acc : Array Name) (fuel : Nat) : Array Name :=
-    match fuel, t with
-    | fuel + 1, .forallE n _ b _ => go b (acc.push n) fuel
-    | _, _ => acc
-  pure (go ci.type #[] 10000)
 
 /-- The call-site edits in one file. A call loses the two arguments. When
     the two sides of the `hv` equation, instantiated with the call's
     arguments, are not definitionally equal (the caller passes its own term
-    for `v`, and the call's other arguments and its type name that term),
-    the call also gets a cast with the `hv` argument `h`:
-    `(by obtain rfl := h; exact (D …))` when the `v` argument is a local
-    variable, else `(h ▸ D …)`. -/
+    for `v`), the call also gets casts with the `hv` argument `h`, in two
+    forms. `argCasts`: each other argument whose binder type names `v`
+    becomes `(h ▸ a)`, and the call becomes `(h ▸ D …)` when its type
+    names `v`. `callCast`: `(by obtain rfl := h; exact (D …))` when the `v`
+    argument is a local variable, else `(h ▸ D …)`. -/
 structure Sites where
-  edits : Array Edit
+  argCasts : Array Edit
+  callCast : Array Edit
   /-- A reason when a call site could not be mapped. -/
   problem : Option String
 
 /-- Every call of `d` in `fe` outside `skip`, for the pairs `(v, hv)`. -/
 def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (skip : Nat × Nat := (0, 0)) : IO Sites := do
-  let fail (msg : String) : Sites := { edits := #[], problem := some msg }
+  let fail (msg : String) : Sites := { argCasts := #[], callCast := #[], problem := some msg }
   let some names := binderNames fe.env d | return fail s!"{d} is not in the environment"
   let some ci := fe.env.find? d | return fail s!"{d} is not in the environment"
+  let allDoms := (telescope ci.type names.size).1
   let mut idx : Array (Nat × Nat) := #[]
-  for (v, hv) in pairs do
+  for (v, _) in pairs do
     let some iv := names.idxOf? (Name.mkSimple v) | return fail s!"{d}'s type does not bind `{v}`"
-    let some ih := names.idxOf? (Name.mkSimple hv) | return fail s!"{d}'s type does not bind `{hv}`"
+    let some ih := eqIndexAfter allDoms iv iv | return fail s!"{d}'s type has no equation for `{v}`"
     idx := idx.push (iv, ih)
   let byRange : Std.HashMap (Nat × Nat) (Array Node) :=
     fe.nodes.foldl (init := {}) fun m n => m.insert (n.start, n.stop) ((m.getD (n.start, n.stop) #[]).push n)
-  let mut edits : Array Edit := #[]
+  let mut argCasts : Array Edit := #[]
+  let mut callCast : Array Edit := #[]
   let mut done : Array (Nat × Nat) := #[]
   for n in fe.nodes do
     unless n.ti.expr.consumeMData.getAppFn.constName? == some d && !n.ti.isBinder do continue
@@ -529,6 +674,7 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (ski
     let full ← n.instExpr
     let args := full.getAppArgs
     let synArgs := n.ti.stx[1].getArgs
+    let (doms, rest) := telescope ci.type args.size
     -- the syntactic argument for binder index `i` named `nm`: its range and its term
     let argFor (i : Nat) (nm : String) : IO (Except String (Option ((Nat × Nat) × Syntax))) := do
       if let some a := synArgs.find? fun a => a.isOfKind ``Parser.Term.namedArgument && identName a[1] == nm then
@@ -546,17 +692,13 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (ski
       return .ok hits[0]?
     -- the `hv` equation of this call: are its sides definitionally equal?
     let sidesDiffer (ih : Nat) : IO Bool := do
-      if ih ≥ args.size then return false
-      let mut t := ci.instantiateTypeLevelParams full.getAppFn.constLevels!
-      for _ in [0:ih] do
-        let .forallE _ _ b _ := t | return false
-        t := b
-      let .forallE _ dom _ _ := t | return false
-      let eq := dom.instantiateRev (args.extract 0 ih)
+      let some dom := doms[ih]? | return false
+      let eq := (dom.instantiateLevelParams ci.levelParams full.getAppFn.constLevels!).instantiateRev
+        (args.extract 0 ih)
       unless eq.isAppOfArity ``Eq 3 do return false
       return !(← n.ti.runMetaM n.ctx (isDefEq (eq.getArg! 1) (eq.getArg! 2)))
     let mut toDelete : Array (Nat × Nat) := #[]
-    let mut casts : Array (String × Bool) := #[]
+    let mut casts : Array (Nat × String × Bool) := #[]
     for ((iv, ih), (v, hv)) in idx.zip pairs do
       let av ← match ← argFor iv v with
         | .ok a => pure a
@@ -569,19 +711,40 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array (String × String)) (ski
         toDelete := toDelete.push r
         let some (ts, te) := rng? t | continue
         if iv < args.size && (← sidesDiffer ih) then
-          casts := casts.push (slice fe.text ts te, args[iv]!.isFVar)
+          casts := casts.push (iv, slice fe.text ts te, args[iv]!.isFVar)
     let dels := deletions fe.text toDelete
     if casts.isEmpty then
-      edits := edits ++ dels
+      argCasts := argCasts ++ dels
+      callCast := callCast ++ dels
+      continue
+    let castWith (hs : Array (Nat × String × Bool)) (t : String) : String :=
+      hs.foldr (fun (_, h, _) acc => h ++ " ▸ " ++ acc) t
+    let toLocal (eds : Array Edit) : Array Edit :=
+      eds.map fun ed => { ed with start := ed.start - n.start, stop := min ed.stop n.stop - n.start }
+    let appText (eds : Array Edit) : String := applyEdits (slice fe.text n.start n.stop) (toLocal eds)
+    -- `argCasts`: the other arguments whose binder types name `v`
+    let mut argEdits := dels
+    for j in [0:args.size] do
+      let hs := casts.filter fun (iv, _, _) => iv < j && (doms[j]?.any (·.hasLooseBVar (j - 1 - iv)))
+      if hs.isEmpty || idx.any (fun (iv, ih) => j == iv || j == ih) then continue
+      let some nm := names[j]? | continue
+      match ← argFor j (nm.eraseMacroScopes.toString (escape := false)) with
+      | .ok (some ((s, e), _)) =>
+        argEdits := argEdits.push { start := s, stop := e, replacement := s!"({castWith hs (slice fe.text s e)})" }
+      | _ => pure ()
+    let resultNames := casts.filter fun (iv, _, _) => iv < doms.size && rest.hasLooseBVar (doms.size - 1 - iv)
+    if resultNames.isEmpty then
+      argCasts := argCasts ++ argEdits
     else
-      let local_ := dels.map fun ed => { ed with start := ed.start - n.start, stop := min ed.stop n.stop - n.start }
-      let app := applyEdits (slice fe.text n.start n.stop) local_
-      let wrapped := if casts.all (·.2) then
-          let obtains := casts.foldl (fun acc (h, _) => acc ++ s!"obtain rfl := {h}; ") ""
-          s!"(by {obtains}exact ({app}))"
-        else
-          casts.foldr (fun (h, _) acc => s!"{h} ▸ {acc}") app |> (s!"({·})")
-      edits := edits.push { start := n.start, stop := n.stop, replacement := wrapped }
-  return { edits, problem := none }
+      let wrappedArgs := s!"({castWith resultNames (appText argEdits)})"
+      argCasts := argCasts.push { start := n.start, stop := n.stop, replacement := wrappedArgs }
+    -- `callCast`
+    let app := appText dels
+    let wrapped := if casts.all (·.2.2) then
+        let obtains := casts.foldl (fun acc (_, h, _) => acc ++ s!"obtain rfl := {h}; ") ""
+        s!"(by {obtains}exact ({app}))"
+      else s!"({castWith casts app})"
+    callCast := callCast.push { start := n.start, stop := n.stop, replacement := wrapped }
+  return { argCasts, callCast, problem := none }
 
 end DefToStructure.Alias
