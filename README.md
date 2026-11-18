@@ -83,13 +83,13 @@ the `hv` argument `h`. Call-site forms, in this order:
 |----------------|------|
 | argument casts | each other argument whose binder type names `v` becomes `(h ▸ a)`; the call becomes `(h ▸ D …)` when its type names `v` |
 | call cast | `(by obtain rfl := h; exact (D …))` when the `v` argument is a local variable, else `(h ▸ D …)` |
-| rewrite casts | for a pair whose two sides are not the same term (also when they are only definitionally equal: a later `rw` needs the caller's term): each other argument `a` whose binder type, beta reduced with the call's arguments, names `v` (sides not definitionally equal) becomes `(by rewrite [E]; exact a)`; a call whose type names `v` becomes `(by have hAlias := D …; rewrite [E] at hAlias; exact hAlias)`; an implicit argument that no remaining explicit argument determines and that is a local variable gets `(b := x)` |
+| rewrite casts | for a pair whose two sides are not the same term (also when they are only definitionally equal: a later `rw` needs the caller's term): each other argument `a` whose binder type, beta reduced with the call's arguments, names `v` (sides not definitionally equal) becomes `(by rewrite [E]; exact a)`; a call whose type names `v` becomes `(by have hAlias := D …; rewrite [E] at hAlias; exact hAlias)`; an implicit argument that no remaining explicit argument determines gets `(b := x)`: `x` is the name of a local variable, else the argument's elaborated value at the original call printed in the call's context (`ppExpr`, one line; not when the print has `✝`, `?` or `sorry`). The REPL check decides whether the print elaborates; when it does not, the form fails and the files keep their texts |
 
 `E` rewrites `rhs` to the caller's term `x`: `h` (or `← h` for `v = rhs`)
 when the elaborated type of `h` has the two sides as they are; else
 `(show rhs' = x from h)`, with `x` and `rhs'` written from the call's
 argument texts (an argument without syntax: the name of its local
-variable). For `h = ?_` (a `refine` goal) the call becomes
+variable, else its printed value as above). For `h = ?_` (a `refine` goal) the call becomes
 `((fun (hAliasEq0 : rhs' = x) => D …) ?_)` and `E` is `hAliasEq0`.
 
 Loop (`stepAlias`): one declaration at a time, the last declaration of the
