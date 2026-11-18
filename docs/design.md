@@ -338,6 +338,26 @@ any time. The other steps share the types of the pass manager, so step 1 defines
 first. After that, steps 2, 3, 4 and 6 can be developed at the same time. Runs on the model
 happen in the fixed pass order, because the passes edit the same files.
 
+**The strict gate of armada-lean waits for the last step.** It fails on any finding, so it
+can merge only when the steps above bring armada-lean to zero findings. Until then, each step
+measures with the current gate (`scripts/check.sh --base`). The port of that gate to Lean is
+parked on armada-lean branch `gate/lean-port` (`f489d01`, worktree `.scratch/gate-lean`). It
+gives the same `--json` and `--base` results as the Python gate at `ab5b476`, apart from the
+intended strict difference. It is not acceptable yet, for four reasons:
+
+- **Speed.** The decision-scope check starts one `lake env lean` process per model file, so the
+  gate takes 12–20 minutes instead of 1–2. The fix is to run the `DecisionScope` linter inside
+  the normal `lake build` through a package option, so each module is checked once and
+  incrementally. Elaborating the files again inside the gate's own environment does not work:
+  that environment already holds their declarations. The acceptance limit is that, on a warm
+  tree, the port is no slower than the Python gate.
+- **Scan count.** The port reports 902 scanned files, but the model has 93.
+- **Unverified claims.** The port claims that a large `unsafe def main` links to the wrong
+  entry point, and it turned off `enableArtifactCache` for the whole package. Both need a
+  minimal reproduction with the cache on and off. Without one, both changes are reverted.
+- **Acceptance not run.** The theorem runs, the build-error comparison,
+  `lake build && scripts/check.sh`, and `test_check_gate.lean` are not run.
+
 ## 11. Differences from the current tool
 
 The current tool has one pass (`alias`), it writes on the wrong layer, and it has several
