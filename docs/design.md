@@ -1,0 +1,342 @@
+# lean-temper: design
+
+Status: proposal, 2026-11-18.
+
+## 1. Overview
+
+Lean projects that an AI writes often build and prove what they claim, but their structure
+is poor. The same value appears under two names. A fact about a value travels beside the
+value as a separate hypothesis, instead of inside its type. The same invariant is restated
+in many theorems. Such a project is correct, but it is hard to read, hard to extend, and
+hard to check against a specification.
+
+lean-temper is a compiler that fixes this structure. Its input is a Lean project that
+builds. Its output is the same project, rewritten into the form that a declared type
+doctrine requires. The rewrite keeps the meaning of every statement. Lean checks every
+edit before the tool keeps it. No person takes part in the rewrite.
+
+The first user is armada-lean, the Lean model of the Armada privacy pool and the Nitro
+state-channel protocol. The tool itself knows nothing about armada-lean. A configuration
+file supplies the facts of each project.
+
+This document is for a reader who knows Lean 4. It does not assume knowledge of compiler
+design or of proof repair. Section 2 defines the terms that the rest of the document uses.
+
+## 2. Terms
+
+**Alias.** A variable that gives a second name to a value that other variables already
+determine, together with an equation that records that fact. Example: a theorem takes
+`c : Channel` and `hc : c = s.channel`. The value `c` adds no information, because
+`s.channel` already fixes it.
+
+**Refined type.** A type whose values carry a fact together with their data, so that a
+value without the fact cannot exist. Example: `{o : List Entry // o.Nodup}` holds only lists
+without duplicates. Lean writes such a type as a subtype or as a structure with a `Prop`
+field.
+
+**Boundary.** A declaration where data enters the model: an operation that creates a new
+state, an initial state, or a constructor of a reachable state. A refined value is built at
+a boundary. Everywhere else, statements receive it already built.
+
+**Intermediate representation (IR).** The form of the program that the compiler works on.
+For lean-temper, the IR is the elaborated project: every declaration with its type, its
+value, the record of how Lean elaborated its source (the info tree), and the list of other
+declarations it uses.
+
+**Pass.** One step of the compiler. A pass finds every instance of one pattern in the IR and
+applies one rewrite to each instance.
+
+**Postcondition.** A property that must hold after a pass. For lean-temper, the
+postcondition of a pass is that its linter reports no finding.
+
+**Change set.** A group of edits that the tool keeps or discards as one unit. When the
+signature of a declaration changes, the change set holds that declaration and every
+declaration that calls it.
+
+**Transport.** Moving a proof from one type to an equivalent type. If two types are
+equivalent, every proof about one gives a proof about the other. Each lean-temper pass
+replaces a type with an equivalent one, so each existing proof can be moved instead of
+written again.
+
+**Translation validation.** A way to make a compiler trustworthy without proving the
+compiler correct: an independent checker checks each output. For lean-temper, Lean is the
+checker. The tool keeps a change set only if Lean accepts it.
+
+**Fixpoint.** The state in which running the passes again changes nothing. The tool repeats
+its passes until it reaches this state.
+
+## 3. Principles
+
+**Every rewrite is an equivalence.** Each pass replaces a form with an equivalent form, and
+the proofs move by transport. This is the method of PUMPKIN Pi, a proof-repair tool for Coq
+(Ringer et al., PLDI 2021). Because the old and the new statement are equivalent, the
+rewrite cannot change what the project proves.
+
+**Lean is the judge.** The tool does not need to prove its own rewrites correct. Lean checks
+each change set through its REPL (a Lean process that keeps its state between commands). At
+the end of a run, a build of the changed modules checks the whole result.
+
+**One rewrite per pattern, and no fallback.** A pass has exactly one rewrite for each
+pattern. If Lean refuses the result, the declaration stays unchanged, the tool records the
+reason, and the run ends with a failure. The tool never tries a second, weaker form. It never
+retries a failed change a fixed number of times. It never substitutes a default value for a
+missing fact.
+
+**The linter decides when a pass is complete.** A pass is complete when its linter reports
+no finding. If a finding remains, the run fails. The project's own gate then checks the
+result independently.
+
+**The output is deterministic.** The same input always gives the same output. When the
+doctrine leaves a choice open, for example the name of a new type, a fixed rule makes the
+choice. If a rule gives a poor result, the rule is a defect of the tool, and the fix goes into
+the tool. No person reviews the choices one by one.
+
+**Parse at the boundary.** This principle comes from functional programming, where it is
+known as "parse, don't validate" (King, 2019). A program should not carry a value next to a
+separate check of that value. It should convert the value into a refined type once, where the
+value enters, and pass the refined type from then on. For lean-temper, this means that a
+refined value is built only at a boundary. Inside the model, statements take the refined
+type, and no conversion is necessary. A conversion or a cast inside the model therefore
+shows that a pass did not finish its work.
+
+## 4. How the compiler works
+
+A run has four stages.
+
+1. **The front end** reads the project into the IR. It opens one REPL session per file and
+   elaborates each file once. The REPL keeps the Lean environment after each command, so the
+   tool can later check one changed declaration without checking the whole file again. The
+   front end also builds the dependency graph: for each declaration, the declarations that its
+   type and its proof use.
+
+2. **The analyses** find the instances of each pattern (section 5), and they compute the
+   boundary set from the boundary roots that the configuration names.
+
+3. **The passes** rewrite the IR. They run in a fixed order. The whole sequence repeats until a
+   fixpoint. Each change set is checked by Lean before the tool keeps it (section 6).
+
+4. **The back end** writes the result back to the source files. It edits only the
+   declarations that a kept change set touched, at the source positions that the info tree
+   records. Then the tool builds the changed modules, runs each pass's linter, and runs the
+   project's gate. The run succeeds only if all of them succeed.
+
+## 5. The passes
+
+The passes run in this order: `alias`, `alias-proof`, `variant`, `refine`, `cleanup`.
+
+### 5.1 `alias`: remove an alias from a statement
+
+**Pattern.** A declaration takes a variable `v` and a hypothesis `hv : v = e`, where `e` is
+built from other variables and does not mention `v`.
+
+**Rewrite.** The pass deletes `v` and `hv`, and puts `e` everywhere the statement used `v`.
+At every call site, it deletes the two arguments that the caller passed for `v` and `hv`.
+
+**Example.**
+
+```lean
+-- before
+theorem stays_open (s : State) (c : Channel) (hc : c = s.channel) (h : Open c) : Final c
+-- a caller
+example : Final s.channel := stays_open s s.channel rfl hopen
+
+-- after
+theorem stays_open (s : State) (h : Open s.channel) : Final s.channel
+example : Final s.channel := stays_open s hopen
+```
+
+**Why the meaning stays the same.** A statement that holds for every `v` equal to `e` holds
+exactly when it holds for `e` itself. In Lean: `(∀ v, v = e → P v) ↔ P e`.
+
+**Statements under specification.** When the declaration is an approved specification
+statement, the pass also writes a proof that the new statement is equivalent to the old one,
+has Lean check it, and then deletes the old statement.
+
+### 5.2 `alias-proof`: remove an alias from inside a proof
+
+**Pattern.** Inside a proof, a tactic introduces a variable together with an equation that
+defines it. The tactics `generalize`, `suffices` and `obtain` can do this. After
+elaboration, all of them leave the same shape in the proof term: a function over the variable
+and its equation, applied to the defining term and to `rfl`.
+
+**Rewrite.** The pass substitutes the defining term into the proof and deletes the steps that
+used the equation. A proof often introduces such a variable only because an induction needs a
+variable, not a compound term such as `W.length`. In that case, the pass rewrites the
+induction as recursion on the data itself, or as recursion with `termination_by` on the term.
+
+**Why the meaning stays the same.** Applying a function to an argument and substituting the
+argument into the function's body give the same result (beta reduction). Lean's kernel
+guarantees that this keeps the type of the proof.
+
+### 5.3 `variant`: reconcile different premises on one field
+
+**Pattern.** Different statements put different conditions on the same field. Example: some
+statements require `bp.treeNumber < N`, and others require `bp.treeNumber ≤ N`.
+
+**Rewrite.** The pass orders the conditions by implication. It proves each implication with a
+fixed decision procedure (`decide`, `omega` or `grind`). The strongest condition becomes the
+refined type, and each weaker condition becomes a lemma that derives it. If the pass cannot
+prove an implication, the group stays unchanged and the run fails.
+
+### 5.4 `refine`: move facts into types
+
+This pass does most of the work. It applies doctrine rules 1 and 2: a fact that a statement
+assumes about its inputs belongs in the type of those inputs.
+
+**Pattern, one input.** A declaration takes a variable `x` and a hypothesis `h : P x` that
+mentions no other input.
+
+**Pattern, several inputs.** Several declarations share the same group of hypotheses over the
+same group of variables. Example: three theorems each take two channels `c₁ c₂` and the
+hypothesis `c₁ ≠ c₂`.
+
+**Finding the groups.** The pass uses formal concept analysis (Ganter and Wille, 1999), a
+standard algorithm for finding shared structure. It treats each declaration as an object and
+each hypothesis, written over its variables, as an attribute of that object. A *concept* is a
+largest group of declarations together with the largest group of hypotheses that all of them
+share. Each concept that covers two or more declarations is an invariant that the model
+repeats, so it is a candidate for a type.
+
+**Choosing among the groups.** Concepts can overlap. The pass chooses by a fixed rule: the
+concept with the most hypotheses first, then the one with the most declarations, then the
+first in source order. A concept whose hypotheses an already chosen concept covers is dropped.
+
+**The type.** If an existing structure already has exactly these fields (Lean checks this by
+definitional equality), the pass uses it. Otherwise it generates the type. One hypothesis on
+one variable gives a subtype. Several give a structure with one field per variable and one
+`Prop` field per hypothesis. The name comes from a fixed scheme: the shared namespace of the
+declarations, then the names of the hypotheses' main constants. A name that already exists
+gets a number.
+
+**The API.** With each new type, the pass generates the operations that doctrine rule 5
+requires: a coercion back to the data, a constructor that checks the hypotheses when they are
+decidable, a lemma that extracts each hypothesis, and an equality lemma. Lean's proof
+irrelevance makes two refined values with equal data equal, so the equality lemma needs no
+extra proof.
+
+**Rewrite.** In each declaration, the variables and their hypotheses become one input of the
+refined type. The statement reads the data through the coercion. The proof starts by opening
+the refined value into its parts, so that the old proof runs on the old names unchanged.
+
+**Example.**
+
+```lean
+-- before: three theorems take this pair of inputs
+theorem resolves (c₁ c₂ : Channel) (hne : c₁ ≠ c₂) … : …
+
+-- after
+structure DistinctChannels where
+  first  : Channel
+  second : Channel
+  distinct : first ≠ second
+
+theorem resolves (cs : DistinctChannels) … : … := by
+  obtain ⟨c₁, c₂, hne⟩ := cs
+  … -- the old proof, unchanged
+```
+
+**Call sites.** A caller that already holds the refined value passes it. A boundary builds it.
+Any other caller is itself an instance of the same concept, so the pass rewrites it in the same
+change set. If a caller is neither, the change set fails, and the declaration stays unchanged.
+
+### 5.5 `cleanup`: delete what the passes replaced
+
+The pass deletes every statement and helper lemma that a rewrite replaced. No deprecated copy
+remains.
+
+## 6. Change sets and their order
+
+When a pass changes the signature of a declaration, every caller of that declaration must
+change too. The tool puts the declaration and all its callers into one change set. Lean checks
+the whole set through the REPL. The tool keeps all of it, or none of it.
+
+The tool processes change sets in the order of the dependency graph: a declaration before the
+declarations that use it. A caller therefore always sees the new form of what it calls.
+
+Change sets that share no file and no caller are independent. The tool checks independent
+change sets at the same time, one REPL session for each available Lean process slot.
+
+## 7. Failure
+
+The tool reports a failure in three ways, and it never hides one.
+
+- A change set that Lean refuses leaves its declarations unchanged. The report names each
+  declaration and the reason.
+- A missing fact stops the run with an error. Examples: a declaration that the tool cannot
+  find in its file, or a configuration key that is absent.
+- The run exits with a failure if the build of the changed modules fails, if any linter still
+  reports a finding, or if the project's gate fails. The tool reads the exit status of each
+  of these commands.
+
+## 8. Configuration
+
+Each project supplies one JSON file. Every key is required. The tool has no default values.
+
+| Key | Meaning |
+|---|---|
+| `sourcePrefix` | The directory of the model's source files. |
+| `protectedPaths` | Paths that the tool never edits. |
+| `boundaryRoots` | The declarations from which the tool derives the boundary set. |
+| `lintCommand` | The commands that build and run the project's linters. |
+| `checkCommand` | The project's gate. |
+| `slots` | The Lean process slots that the tool may use. |
+
+## 9. Acceptance
+
+A step of the work is done only when the tool has run on the real project and Lean has
+accepted the result. For armada-lean, each step must meet three conditions:
+
+1. The tool runs on armada-lean, and Lean accepts every change set that the tool keeps.
+2. The step's linter reports no finding for the instances in its scope.
+3. The project's strict gate (`scripts/check.sh`) fails only on findings outside the step's
+   scope, and no count is higher than before the step.
+
+The strict gate passes only when the model has no finding at all. The steps therefore
+accumulate on one branch. The merge through the project's own process happens once, after the
+last step, when the gate passes. That merge completes the work.
+
+Tests on small Lean snippets help the developer of a pass. They run real Lean, with no mock,
+but they do not make a step done. When a developer tests one change on the model, the work list
+holds only the instances that the change must fix.
+
+## 10. Build plan
+
+| Step | Content | Instances on armada-lean `integrated` (`ab5b476`) |
+|---|---|---|
+| 1 | The pass manager: the IR, the dependency graph, change sets, the fixpoint, the failure rules of section 7. The existing alias pass moves onto it. | — |
+| 2 | `alias-proof` | 10 restated statements and 8 aliases from `generalize` |
+| 3 | `alias` on specification statements, with the equivalence proofs | 17 findings |
+| 4 | `refine` for one input | 217 hypotheses on one input, and 25 one-variable groups |
+| 5 | Formal concept analysis, and `refine` for several inputs | 197 groups |
+| 6 | `variant` | 9 groups |
+
+The formal concept analysis is a self-contained algorithm, and its development can start at
+any time. The other steps share the types of the pass manager, so step 1 defines those types
+first. After that, steps 2, 3, 4 and 6 can be developed at the same time. Runs on the model
+happen in the fixed pass order, because the passes edit the same files.
+
+## 11. Differences from the current tool
+
+The current tool has one pass (`alias`) and several fallbacks. The design removes each
+fallback:
+
+- When the tool cannot rewrite a proof directly, it no longer tries `generalize` instead.
+- When a caller does not fit the changed declaration, it no longer tries a series of casts
+  until one works. The change set rewrites the caller, or the change fails.
+- It no longer retries failed declarations a fixed second time. It repeats all passes until
+  nothing changes.
+- It reads the exit status of the project's gate, and a failed gate fails the run.
+- When it cannot find a declaration in its file, it stops with an error. It no longer checks
+  the edit against the start of the file.
+- It checks every changed file through the REPL, and skips none.
+
+## 12. References
+
+- Ringer, Porter, Yazdani, Leo, Grossman. *Proof Repair across Type Equivalences.* PLDI 2021.
+- Ganter, Wille. *Formal Concept Analysis: Mathematical Foundations.* Springer, 1999.
+- King. *Parse, don't validate.* 2019.
+- Christiansen. *Functional Programming in Lean*: the sections on subtypes and on the pitfalls
+  of programming with dependent types.
+- Mathlib, `Finset`: a list-like value bundled with the fact that it has no duplicates.
+- LLVM `opt` and the MLIR canonicalization pass: compilers built from passes, fixpoints and
+  postconditions.

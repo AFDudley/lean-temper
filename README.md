@@ -12,6 +12,9 @@ source lives, how to run its lint and its final check — are a JSON config
 file the run names (`--config`), not code. `examples/armada-lean.json` is
 the config for armada-lean.
 
+`docs/design.md` describes the planned design: the passes, their order, the
+failure rules, and the build plan. This README describes the tool as it is now.
+
 ## The alias pass
 
 ```
