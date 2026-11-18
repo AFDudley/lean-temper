@@ -505,13 +505,26 @@ def aliasCases : List AliasCase := [
     decl := `callee4, binders := #["tn"], proof := .substituted, rewrite := true,
     want := "def insT (l : List Nat) (n : Nat) : Nat := l.length + n\n\ntheorem callee4 (trees nl : List Nat) : (insT trees nl.length) = insT trees nl.length := rfl\n\ntheorem caller4 (t : List Nat) (x : Nat) (y : Nat) (hy : y = insT t 1) : y = insT t 1 := by\n  have h := (by have hAlias := callee4 t [x]; rewrite [← (show (insT t 1) = (insT t ([x]).length) from rfl)] at hAlias; exact hAlias)\n  rw [h]; exact hy\n" } ]
 
+def extraAliasCases : List AliasCase := [
+  -- class 3: an implicit argument whose value is no local variable: printed from the info tree
+  { name := "an implicit argument that is no local variable: its printed value as a named argument",
+    src := "def hc (p : Nat) : Nat := p + 1\n\ndef Cons (r : Nat → Nat) : Prop := True\n\ndef recStep (r : Nat → Nat) (c p : Nat) : Nat → Nat := fun x => if x = c then p else r x\n\ntheorem callee3 {r : Nat → Nat} (hr : Cons r) {c : Nat} {p : Nat} (hv : hc p = c) : Cons (recStep r c p) := trivial\n\ntheorem caller3 (r : Nat → Nat) (hr : Cons r) (cs ps : Nat → Nat) (hvalid : ∀ i, hc (ps i) = cs i) (i : Nat) :\n    Cons (recStep r (cs i) (ps i)) := callee3 hr (hvalid i)\n",
+    decl := `callee3, binders := #["c"], proof := .unchanged, rewrite := true,
+    want := "def hc (p : Nat) : Nat := p + 1\n\ndef Cons (r : Nat → Nat) : Prop := True\n\ndef recStep (r : Nat → Nat) (c p : Nat) : Nat → Nat := fun x => if x = c then p else r x\n\ntheorem callee3 {r : Nat → Nat} (hr : Cons r) {p : Nat} : Cons (recStep r (hc p) p) := trivial\n\ntheorem caller3 (r : Nat → Nat) (hr : Cons r) (cs ps : Nat → Nat) (hvalid : ∀ i, hc (ps i) = cs i) (i : Nat) :\n    Cons (recStep r (cs i) (ps i)) := (by have hAlias := callee3 hr (p := (ps i)); rewrite [(hvalid i)] at hAlias; exact hAlias)\n" },
+  -- class 6: `rhs` names variables of the statement's leading `∀`
+  { name := "rhs names variables of the statement's `∀`: they become binders, then move before `hord`",
+    src := "theorem aux (order : List Nat) (hord : order.length = order.length) (d : Nat) :\n    ∀ suf pre : List Nat, order = pre ++ suf → (pre ++ suf).length + d = order.length + d := by\n  intro suf\n  induction suf with\n  | nil => intro pre h; rw [h]\n  | cons c rest ih => intro pre h; rw [h]\n\ntheorem useAux (l : List Nat) : ([] ++ l).length + 0 = l.length + 0 := aux l rfl 0 l [] rfl\n",
+    decl := `aux, binders := #["order"], proof := .restated,
+    want := "theorem aux (suf pre : List Nat) (hord : (pre ++ suf).length = (pre ++ suf).length) (d : Nat) :\n    (pre ++ suf).length + d = (pre ++ suf).length + d := by\n  suffices hAlias : ∀ (order : List Nat) (hord : order.length = order.length), order = pre ++ suf → (pre ++ suf).length + d = order.length + d from (hAlias _ hord rfl); intro order hord; suffices hHoist : ∀ suf pre : List Nat, order = pre ++ suf → (pre ++ suf).length + d = order.length + d from hHoist suf pre; intro suf\n  induction suf with\n  | nil => intro pre h; rw [h]\n  | cons c rest ih => intro pre h; rw [h]\n\ntheorem useAux (l : List Nat) : ([] ++ l).length + 0 = l.length + 0 := aux l [] rfl 0\n" } ]
+
 def runAliasCase (c : AliasCase) : IO Bool := do
-  let fe ← Alias.elabText "t.lean" `t c.src
-  unless fe.errors.isEmpty do
-    IO.println s!"FAIL {c.name}: the snippet has errors: {fe.errors}"
+  let fe0 ← Alias.elabText "t.lean" `t c.src
+  unless fe0.errors.isEmpty do
+    IO.println s!"FAIL {c.name}: the snippet has errors: {fe0.errors}"
     return false
   let fs := c.binders.map fun b => { declaration := c.decl.toString, binder := b, rhs := "", at_ := "t.lean:1" }
-  match Alias.declEdits fe c.decl fs with
+  let (fe, deE) ← Alias.declEditsHoisting fe0 c.decl fs "t.lean" `t
+  match deE with
   | .error msg =>
     IO.println s!"FAIL {c.name}: {msg}"
     return false
@@ -535,7 +548,7 @@ def runAliasCase (c : AliasCase) : IO Bool := do
       else pure (if c.callCast then sites.callCast else sites.argCasts)
     let .ok edits := Alias.nest (de.sig ++ proof ++ calls)
       | IO.println s!"FAIL {c.name}: overlapping edits"; return false
-    let got := applyEdits c.src edits
+    let got := applyEdits fe.text edits
     unless got == c.want do
       IO.println s!"FAIL {c.name}:\n--- got\n{got}--- want\n{c.want}"
       return false
@@ -601,7 +614,7 @@ unsafe def main (args : List String) : IO UInt32 := do
     unless ← runCase env c do failed := failed + 1
   total := total + 1
   unless ← silentCase env do failed := failed + 1
-  for c in aliasCases do
+  for c in aliasCases ++ extraAliasCases do
     total := total + 1
     unless ← runAliasCase c do failed := failed + 1
   let c ← Repl.start repl (← Discovery.targetSearchPath root) "/dev/null"

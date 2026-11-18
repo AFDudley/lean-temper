@@ -584,8 +584,10 @@ def stepAlias : M Unit := do
         log s!"[alias]   elaborated {rel} in {← secs t0}s"
         unless fe.errors.isEmpty do stop s!"{rel} has errors before the edit: {fe.errors[0]!}"
         return fe
-      let fe ← elabFile u.file
-      let de ← match Alias.declEdits fe u.decl u.findings with
+      let fe0 ← elabFile u.file
+      -- `fe` is the hoisted text when `rhs` names a variable of the statement's `∀`
+      let (fe, deE) ← Alias.declEditsHoisting fe0 u.decl u.findings (e.root / u.file).toString (moduleName u.file)
+      let de ← match deE with
         | .ok de => pure de
         | .error msg =>
           units := units.set! ui { u with attempts := #[("analysis", msg)] }
@@ -664,7 +666,9 @@ def stepAlias : M Unit := do
             | none => #[]
           let own := if rel == u.file then de.sig ++ peds else #[]
           match Alias.nest (call ++ own) with
-          | .ok eds => texts := texts.push (rel, applyEdits (disk.getD rel "") eds)
+          | .ok eds =>
+            let base := if rel == u.file then fe.text else disk.getD rel ""
+            texts := texts.push (rel, applyEdits base eds)
           | .error msg => bad := some s!"{rel}: {msg}"
         let dEdits := Alias.nest (de.sig ++ peds ++ #[rename])
         let dStubEdits := Alias.nest (de.sig ++ #[rename, stubValue])

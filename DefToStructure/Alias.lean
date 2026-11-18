@@ -734,6 +734,70 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
   return { sig, proof := proof >>= nest, preamble, restated, proofNames := names, pairs, declIdEnd,
            valueRange := (valStart, valStop), isTheorem := decl.isOfKind ``Parser.Command.theorem, moved }
 
+/-- The hoist of a statement's leading `∀ x y : T,` into the declaration's
+    binders, `(x y : T)` after the last binder: the type stays the same chain
+    of `∀`, so no call site changes. The proof starts with
+    `suffices hHoist : ∀ x y : T, … from hHoist x y;` (the old statement, on
+    one line): it keeps its text and its context. Used when `rhs` names a
+    variable of that `∀` (`declEdits` refuses it); `declEdits` then runs on
+    the hoisted text, where the class-5 move puts `(x y : T)` before the
+    binders that name `v`. -/
+def hoistEdits (fe : FileElab) (d : Name) : Except String (Array Edit) := do
+  let some cmd0 := declCommand? fe d | throw s!"{d} has no declaration command in its file"
+  let some parts := declParts? cmd0 | throw s!"{d} is not a `theorem` or `def` with a type"
+  let fa := parts.type
+  unless fa.isOfKind ``Parser.Term.forall do throw "the statement does not start with `∀`"
+  let body := fa[fa.getNumArgs - 1]!
+  let some (ts, te) := rng? fa | throw "no range"
+  let some (bs, _) := rng? body | throw "no range"
+  let binders := fa[1].getArgs
+  let mut groups : Array String := #[]
+  let mut names : Array String := #[]
+  if binders.all (fun b => !b.isOfKind ``Parser.Term.explicitBinder && !b.isOfKind ``Parser.Term.implicitBinder &&
+      !b.isOfKind ``Parser.Term.strictImplicitBinder && !b.isOfKind ``Parser.Term.instBinder) then
+    let some (tys, tye) := rng? fa[2] | throw "the `∀` binders have no type to write"
+    let ty := (slice fe.text tys tye).trimAscii.copy
+    let ty := if ty.startsWith ":" then (ty.drop 1).trimAscii.copy else ty
+    names := binders.map fun b => (slice fe.text ((rng? b).map (·.1) |>.getD 0) ((rng? b).map (·.2) |>.getD 0))
+    if names.any (· == "_") then throw "an anonymous `∀` binder"
+    groups := #[s!"({" ".intercalate names.toList} : {ty})"]
+  else
+    for b in binders do
+      let some (s, e) := rng? b | throw "no range"
+      groups := groups.push (slice fe.text s e)
+      let g := groupOf b
+      if g.idents.isEmpty || g.idents.any (!·.isIdent) then throw "a `∀` binder without a name"
+      names := names ++ g.idents.map identName
+  let insertAt ← match parts.groups.back? with
+    | some g => match rng? g.stx with
+      | some (_, e) => pure e
+      | none => throw "no range"
+    | none => match rng? parts.cmd[1][1] with
+      | some (_, e) => pure e
+      | none => throw "no range"
+  let some (start, tactic) := proofStart? parts.value | throw "no proof to keep"
+  let some (ps, _) := rng? start | throw "no range"
+  let stmt := " ".intercalate (((slice fe.text ts te).splitOn "\n").map (·.trimAsciiStart.copy))
+  let pre := s!"suffices hHoist : {stmt} from hHoist {" ".intercalate names.toList}; "
+  return #[{ start := insertAt, stop := insertAt, replacement := " " ++ " ".intercalate groups.toList },
+           { start := ts, stop := bs, replacement := "" },
+           { start := ps, stop := ps, replacement := if tactic then pre else s!"by {pre}exact " }]
+
+/-- `declEdits`, and when `rhs` names a variable of the statement's leading
+    `∀`: the hoisted text (`hoistEdits`), its elaboration, and `declEdits` on it. -/
+def declEditsHoisting (fe : FileElab) (d : Name) (fs : Array Finding) (fileName : String) (mod : Name) :
+    IO (FileElab × Except String DeclEdits) := do
+  match declEdits fe d fs with
+  | .ok de => return (fe, .ok de)
+  | .error msg =>
+    unless (msg.splitOn "a variable of the statement").length > 1 do return (fe, .error msg)
+    match hoistEdits fe d with
+    | .error m => return (fe, .error s!"{msg}; the hoist: {m}")
+    | .ok eds =>
+      let fe' ← elabText fileName mod (applyEdits fe.text eds)
+      unless fe'.errors.isEmpty do return (fe, .error s!"{msg}; the hoisted text has errors: {fe'.errors[0]!}")
+      return (fe', declEdits fe' d fs)
+
 -- --- call sites ------------------------------------------------------------------
 
 /-- One pair as the call sites need it. -/
@@ -913,13 +977,26 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
       let ld' ← n.ti.lctx.findFromUserName? ld.userName
       guard (ld'.fvarId == id)
       pure (ld.userName.toString (escape := false))
+    -- an argument without syntax as source text: a local variable's name, else
+    -- the elaborated value printed in the call's context (one line, in
+    -- parentheses); none when the print names an inaccessible variable or
+    -- has a hole. The REPL check decides whether the text elaborates there.
+    let exprText (x : Expr) : IO (Option String) := do
+      if let some nm := localName x then return some nm
+      if x.hasMVar then return none
+      let f ← n.ti.runMetaM n.ctx (withOptions (fun o => o.setBool `pp.mvars false) (ppExpr x))
+      let s := f.pretty 100000
+      if s.contains '✝' || s.contains '?' || (s.splitOn "sorry").length > 1 || s.contains '\n' then return none
+      return some (if s.contains ' ' then s!"({s})" else s)
     -- the text of binder `k`'s argument at this call
     let argText (k : Nat) : IO (Option String) := do
       match ← syntaxFor k with
       | some (_, t) => return (rng? t).map fun (s, e) =>
           let x := slice fe.text s e
           if (atomic t) then x else s!"({x})"
-      | none => return (args[k]?.bind localName)
+      | none => match args[k]? with
+        | some x => exprText x
+        | none => return none
     -- the `hv` equation of this call
     let eqOf (ih : Nat) : Option Expr := do
       let dom ← doms[ih]?
@@ -971,7 +1048,9 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
     let dels := deletions fe.text toDelete ++ moveIns ++ renames.filter fun r => n.start ≤ r.start && r.stop ≤ n.stop
     let toLocal (eds : Array Edit) : Array Edit :=
       eds.map fun ed => { ed with start := ed.start - n.start, stop := min ed.stop n.stop - n.start }
-    let appText (eds : Array Edit) : String := applyEdits (slice fe.text n.start n.stop) (toLocal eds)
+    -- a deleted last line leaves its line break: the call text ends at its last token
+    let appText (eds : Array Edit) : String :=
+      (applyEdits (slice fe.text n.start n.stop) (toLocal eds)).trimAsciiEnd.copy
     -- `rewriteCasts`
     let relevant := cps.filter fun cp => cp.synDiff && cp.iv < args.size
     if relevant.isEmpty then rewrite := rewrite ++ dels
@@ -1052,7 +1131,8 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
           let determined := (List.range (min args.size doms.size)).any fun j =>
             j > k && isExplicit j && !deleted j && !castArgs.contains j && doms[j]!.hasLooseBVar (j - 1 - k)
           if determined then continue
-          if let some x := args[k]?.bind localName then named := named ++ s!" ({nameStr k} := {x})"
+          if let some x := args[k]? then
+            if let some t ← exprText x then named := named ++ s!" ({nameStr k} := {t})"
         unless named.isEmpty do argEdits := argEdits.push { start := n.stop, stop := n.stop, replacement := named }
       let lamPre := if lambdas.isEmpty then "" else s!"((fun {" ".intercalate lambdas.toList} => "
       let lamPost := if lambdas.isEmpty then "" else s!") {" ".intercalate holes.toList})"
