@@ -39,9 +39,16 @@ state, an initial state, or a constructor of a reachable state. A refined value 
 a boundary. Everywhere else, statements receive it already built.
 
 **Intermediate representation (IR).** The form of the program that the compiler works on.
-For lean-temper, the IR is the elaborated project: every declaration with its type, its
-value, the record of how Lean elaborated its source (the info tree), and the list of other
-declarations it uses.
+For lean-temper, the IR has two linked layers for each declaration:
+
+- the **Syntax** tree of its source command, as the Lean parser produced it. Each node keeps
+  its source text, and the whitespace and comments around it (`SourceInfo.original`), so
+  `Syntax.reprint` gives back the original text byte for byte;
+- the elaborated **`Expr`** of its type and its value, which the kernel checks.
+
+The info tree links each Syntax node to the `Expr` that Lean elaborated from it. The IR also
+holds the dependency graph: for each declaration, the declarations that its type and its
+value use.
 
 **Pass.** One step of the compiler. A pass finds every instance of one pattern in the IR and
 applies one rewrite to each instance.
@@ -49,8 +56,9 @@ applies one rewrite to each instance.
 **Postcondition.** A property that must hold after a pass. For lean-temper, the
 postcondition of a pass is that its linter reports no finding.
 
-**Change set.** A group of edits that the tool keeps or discards as one unit. When the
-signature of a declaration changes, the change set holds that declaration and every
+**Change set.** A group of rewrites that the tool keeps or discards as one unit. A rewrite
+replaces a Syntax node of a declaration with a new Syntax node, never a range of bytes. When
+the signature of a declaration changes, the change set holds that declaration and every
 declaration that calls it.
 
 **Transport.** Moving a proof from one type to an equivalent type. If two types are
@@ -99,6 +107,17 @@ refined value is built only at a boundary. Inside the model, statements take the
 type, and no conversion is necessary. A conversion or a cast inside the model therefore
 shows that a pass did not finish its work.
 
+**Decide on `Expr`, write on Syntax, never on text.** A pass decides what an instance is, and
+what the rewrite means, from the elaborated `Expr`, through the info tree. It writes the
+rewrite as a change to the Syntax tree. The new source is the reprint of the changed tree, so
+every part that the rewrite did not touch keeps its text, its whitespace and its comments.
+The tool never computes a byte range, never inserts a string, and never guesses parentheses:
+a new subterm is a Syntax node, and Lean's parenthesizer
+(`Lean.PrettyPrinter.parenthesizeCommand`) adds parentheses where the precedence of the
+surrounding node requires them. Input from outside the tool (the work list, the linter's
+findings, the configuration) is parsed once into typed values, `Name`s and positions, and a
+malformed input stops the run.
+
 ## 4. How the compiler works
 
 A run has four stages.
@@ -115,10 +134,10 @@ A run has four stages.
 3. **The passes** rewrite the IR. They run in a fixed order. The whole sequence repeats until a
    fixpoint. Each change set is checked by Lean before the tool keeps it (section 6).
 
-4. **The back end** writes the result back to the source files. It edits only the
-   declarations that a kept change set touched, at the source positions that the info tree
-   records. Then the tool builds the changed modules, runs each pass's linter, and runs the
-   project's gate. The run succeeds only if all of them succeed.
+4. **The back end** writes the result back to the source files. For each declaration that a
+   kept change set touched, it replaces the command's text with the reprint of the changed
+   Syntax tree. Then the tool builds the changed modules, runs each pass's linter, and runs
+   the project's gate. The run succeeds only if all of them succeed.
 
 ## 5. The passes
 
@@ -129,8 +148,12 @@ The passes run in this order: `alias`, `alias-proof`, `variant`, `refine`, `clea
 **Pattern.** A declaration takes a variable `v` and a hypothesis `hv : v = e`, where `e` is
 built from other variables and does not mention `v`.
 
-**Rewrite.** The pass deletes `v` and `hv`, and puts `e` everywhere the statement used `v`.
-At every call site, it deletes the two arguments that the caller passed for `v` and `hv`.
+**Rewrite.** On the Syntax tree of the declaration, the pass deletes the binder nodes of `v`
+and `hv`. It replaces each identifier node that elaborated to `v` with the Syntax node of `e`,
+and each identifier node that elaborated to `hv` with `rfl`. This holds in the statement and
+in the proof. At every call site, it deletes the argument nodes that elaborated to the
+arguments at the positions of `v` and `hv`. The info tree identifies each of these nodes. If
+Lean refuses the result, the declaration stays unchanged and the failure is reported.
 
 **Example.**
 
@@ -303,7 +326,7 @@ holds only the instances that the change must fix.
 
 | Step | Content | Instances on armada-lean `integrated` (`ab5b476`) |
 |---|---|---|
-| 1 | The pass manager: the IR, the dependency graph, change sets, the fixpoint, the failure rules of section 7. The existing alias pass moves onto it. | — |
+| 1 | The pass manager: the two-layer IR (Syntax and `Expr`), the dependency graph, change sets of Syntax rewrites, the reprint back end, typed input, the fixpoint, the failure rules of section 7. The alias pass is rewritten onto it, with the rewrite of section 5.1 and no fallback form. | 36 internal findings at armada-lean `9c6ef1b` (the acceptance set) |
 | 2 | `alias-proof` | 10 restated statements and 8 aliases from `generalize` |
 | 3 | `alias` on specification statements, with the equivalence proofs | 17 findings |
 | 4 | `refine` for one input | 217 hypotheses on one input, and 25 one-variable groups |
@@ -317,9 +340,12 @@ happen in the fixed pass order, because the passes edit the same files.
 
 ## 11. Differences from the current tool
 
-The current tool has one pass (`alias`) and several fallbacks. The design removes each
-fallback:
+The current tool has one pass (`alias`), it writes on the wrong layer, and it has several
+fallbacks. The design removes each of these defects:
 
+- It no longer edits text. Today the alias pass decides on the info tree correctly, but it
+  writes byte-range deletions, inserts the right-hand side as a string, and guesses
+  parentheses (`atomic`). Its input is strings (`Finding`, with `at` split on `:`).
 - When the tool cannot rewrite a proof directly, it no longer tries `generalize` instead.
 - When a caller does not fit the changed declaration, it no longer tries a series of casts
   until one works. The change set rewrites the caller, or the change fails.
