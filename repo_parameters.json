@@ -1,0 +1,10 @@
+{
+  "git_remote": "AFDudley.github.com",
+  "subtrees": [],
+  "pebble_tracker_prefixes": {
+    "root": "ltm-"
+  },
+  "commit_trailer_categories": ["hygiene", "refactor", "docs", "infrastructure", "pebble-filing"],
+  "gate_commands": {},
+  "deploy_surfaces": {}
+}
