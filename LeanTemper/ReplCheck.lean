@@ -1,6 +1,6 @@
 /-
   The check of an alias candidate through the Lean REPL (see ../README.md,
-  "Alias mode", and `DefToStructure.Repl`).
+  "Alias mode", and `LeanTemper.Repl`).
 
   A file runs once in the REPL, one command per request, so that the
   environment after each command stays available (`Session`). An
@@ -12,14 +12,14 @@
   in-process elaboration of the same text (`Alias.FileElab`).
 -/
 import Lean
-import DefToStructure.Alias
-import DefToStructure.Repl
+import LeanTemper.Alias
+import LeanTemper.Repl
 
 open Lean
 
-namespace DefToStructure.ReplCheck
+namespace LeanTemper.ReplCheck
 
-open DefToStructure.Alias
+open LeanTemper.Alias
 
 /-- The suffix of the fresh name of a candidate. -/
 def suffix : String := "_aliasCheck"
@@ -162,4 +162,4 @@ def check (c : Repl.Client) (dSess : Session) (dIdx : Nat) (dText dStub : String
     callErrs := callErrs ++ errs.map fun m => s!"{s.rel}:{l0 + m.line - 1}:{m.col}: {m.text}"
   return (#[], callErrs)
 
-end DefToStructure.ReplCheck
+end LeanTemper.ReplCheck

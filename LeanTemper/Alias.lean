@@ -23,11 +23,11 @@
   `v = rhs`): the context and the goal are then the original ones again.
 -/
 import Lean
-import DefToStructure.Patterns
+import LeanTemper.Edit
 
 open Lean Elab Meta
 
-namespace DefToStructure.Alias
+namespace LeanTemper.Alias
 
 /-- One work-list entry (`scripts/type_lint.lean` output plus `at`). -/
 structure Finding where
@@ -1106,4 +1106,4 @@ def callSites (fe : FileElab) (d : Name) (pairs : Array SitePair) (skip : Nat ×
   | .ok a, .ok b => return { argCasts := a, callCast := b, rewriteCasts, problem := none }
   | .error msg, _ | _, .error msg => return fail msg
 
-end DefToStructure.Alias
+end LeanTemper.Alias

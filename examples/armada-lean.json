@@ -1,0 +1,9 @@
+{
+  "protectedPaths": ["ArmadaLean/Spec/", "ArmadaLean/Lint/"],
+  "sourcePrefix": "ArmadaLean",
+  "lintCommand": [
+    ["lake", "build", "ArmadaLean.Lint.TypeDoctrine", "ArmadaLean.Lint.TypeDoctrineTest"],
+    ["lake", "env", "lean", "scripts/type_lint.lean"]
+  ],
+  "checkCommand": ["bash", "scripts/check.sh", "--json"]
+}

@@ -10,11 +10,11 @@
   messages of `text` alone, at positions in `text`.
 -/
 import Lean
-import DefToStructure.Proc
+import LeanTemper.Proc
 
 open Lean
 
-namespace DefToStructure.Repl
+namespace LeanTemper.Repl
 
 structure Client where
   child : IO.Process.Child { stdin := .piped, stdout := .piped, stderr := .inherit }
@@ -29,7 +29,7 @@ structure Msg where
   text : String
   deriving Inhabited
 
-/-- Start the REPL with the target's `LEAN_PATH` (`Discovery.targetSearchPath`). -/
+/-- Start the REPL with the target's `LEAN_PATH` (`LeanTemper.targetSearchPath`). -/
 def start (repl : System.FilePath) (leanPath : List System.FilePath) (logPath : System.FilePath) : IO Client := do
   let lp := ":".intercalate (leanPath.map (·.toString))
   let child ← IO.Process.spawn {
@@ -80,4 +80,4 @@ def Client.cmd (c : Client) (text : String) (env : Option Nat) : IO (Nat × Arra
     else none
   return (n, errs)
 
-end DefToStructure.Repl
+end LeanTemper.Repl

@@ -1,90 +1,85 @@
 /-
-  `def_to_structure`: the driver (see README.md).
+  `lean-temper`: the driver (see README.md).
 
-    def_to_structure --checkout <armada-lean worktree> --slot <1-4> \
-      --names RegistryConsistent,Adjudicator.IsDAG --report report.json [--resume]
+    lean-temper --checkout <target worktree> --slot <1-4> --config CONFIG.json \
+      --alias WORKLIST.json --repl REPL --report report.json
 
   Steps:
-  1. `lake build`, the linter modules, `scripts/type_lint.lean` (the "before" list).
-  2. Import the target's modules into this process (discovery, and the parser
-     for the repair loop).
-  3. Discovery and the guards (`ArmadaLean/Spec/`, `git grep Spec\.<name>`).
-  4. Conversion: `def` → `structure … where holds : body`, plus `P.iff`.
-  5. The files that import a converted module, in dependency order, each
-     through `lake serve`: open, read the diagnostics, decide one repair per
-     error from the elaboration data (`DefToStructure.Patterns`), apply, send
-     `didChange`, repeat until the file has no error and no silent projection.
-     An edited module is rebuilt (`lake build <Module>`) before the next file
-     opens. A round with an error and no repair stops the tool.
-  6. One full check: `lake build`, the linter modules, `scripts/type_lint.lean`
-     (the "after" list), `scripts/update_gate_baseline.py --hashes-only`,
-     `bash scripts/check.sh --json`, and the JSON report.
-
-  `--resume` continues a stopped run after a hand edit: it skips steps 1, 3
-  and 4 and reads `<checkout>/.scratch/codemod/state.json`.
+  1. `lake build`, then the lint command (`Config.lintCommand`), the "before" list.
+  2. The alias pass (`stepAlias`, `LeanTemper.Alias`): each declaration of the
+     work list, the last declaration of the last file first, through the
+     Lean REPL (`LeanTemper.ReplCheck`).
+  3. One full check: `lake build`, the lint command (the "after" list), and
+     the check command (`Config.checkCommand`), and the JSON report.
 -/
 import Lean
-import DefToStructure.Lsp
-import DefToStructure.Parse
-import DefToStructure.Patterns
-import DefToStructure.Discovery
-import DefToStructure.Alias
-import DefToStructure.ReplCheck
+import LeanTemper.Target
+import LeanTemper.Alias
+import LeanTemper.ReplCheck
 
-open Lean DefToStructure DefToStructure.Discovery
+open Lean LeanTemper
 
-namespace DefToStructure
+namespace LeanTemper
 
 structure Args where
   checkout : System.FilePath
   slot : Nat
-  names : Array String
+  config : System.FilePath
+  /-- `--alias WORKLIST.json`: the declarations the alias pass (`LeanTemper.Alias`) treats. -/
+  alias : System.FilePath
+  /-- `--repl PATH`: the Lean REPL binary the pass checks a candidate edit through. -/
+  repl : System.FilePath
   report : System.FilePath
-  resume : Bool
-  /-- `--alias WORKLIST.json`: the alias transform (`DefToStructure.Alias`). -/
-  alias : Option System.FilePath := none
-  /-- `--repl PATH`: the Lean REPL binary for the alias mode's checks. -/
-  repl : Option System.FilePath := none
 
 def parseArgs (args : List String) : Except String Args := do
   let mut checkout := ""
   let mut slot := 0
-  let mut names := ""
-  let mut report := ""
-  let mut resume := false
+  let mut config := ""
   let mut alias := ""
   let mut repl := ""
+  let mut report := ""
   let mut rest := args
   while !rest.isEmpty do
     match rest with
     | "--checkout" :: v :: r => checkout := v; rest := r
     | "--slot" :: v :: r => slot := v.toNat!; rest := r
-    | "--names" :: v :: r => names := v; rest := r
-    | "--report" :: v :: r => report := v; rest := r
-    | "--resume" :: r => resume := true; rest := r
+    | "--config" :: v :: r => config := v; rest := r
     | "--alias" :: v :: r => alias := v; rest := r
     | "--repl" :: v :: r => repl := v; rest := r
+    | "--report" :: v :: r => report := v; rest := r
     | a :: _ => throw s!"unknown argument {a}"
     | [] => pure ()
-  if checkout.isEmpty || slot == 0 || (names.isEmpty && alias.isEmpty) || report.isEmpty || (resume && !alias.isEmpty)
-      || (!alias.isEmpty && repl.isEmpty) then
-    throw "usage: def_to_structure --checkout DIR --slot N (--names A,B [--resume] | --alias WORKLIST.json --repl REPL) --report FILE"
-  return { checkout, slot, names := (names.splitOn ",").map (·.trimAscii.copy) |>.filter (· ≠ "") |>.toArray,
-           report, resume, alias := if alias.isEmpty then none else some alias,
-           repl := if repl.isEmpty then none else some repl }
+  if checkout.isEmpty || slot == 0 || config.isEmpty || alias.isEmpty || repl.isEmpty || report.isEmpty then
+    throw "usage: lean-temper --checkout DIR --slot N --config CONFIG.json --alias WORKLIST.json --repl REPL --report FILE"
+  return { checkout, slot, config, alias, repl, report }
+
+/-- Project-specific rules (`--config PATH`, see README.md, "Configuration").
+    Every field is required; a missing file or a missing key stops the run. -/
+structure Config where
+  /-- Paths (a directory prefix ending `/`) the tool never writes. -/
+  protectedPaths : Array String
+  /-- The prefix of the target's own source tree (`ArmadaLean`): the file
+      `<prefix>.lean`, the directory `<prefix>/`. -/
+  sourcePrefix : String
+  /-- The commands that run the target's lint, in order; the last command's
+      standard output is the lint's JSON-lines findings and summary. -/
+  lintCommand : Array (Array String)
+  /-- The target's final check command; the tool appends `--base <head>`. -/
+  checkCommand : Array String
+  deriving FromJson
+
+def loadConfig (path : System.FilePath) : IO (Except String Config) := do
+  let text ← try pure (some (← IO.FS.readFile path)) catch e => do IO.eprintln s!"--config: {e}"; pure none
+  let some text := text | return .error s!"--config: cannot read {path}"
+  match Json.parse text with
+  | .error err => return .error s!"--config: {path} is not valid JSON: {err}"
+  | .ok j => match fromJson? (α := Config) j with
+    | .ok c => return .ok c
+    | .error err => return .error s!"--config: {path}: {err}"
 
 /-- A stop: the tool changes nothing more and reports `msg`. -/
 structure StopError where
   msg : String
-
-structure RepairRecord where
-  file : String
-  line : Nat
-  col : Nat
-  pattern : String
-  pred : Option String
-  detail : String
-  deriving ToJson, FromJson, Inhabited
 
 structure Timing where
   command : String
@@ -96,26 +91,9 @@ structure Timing where
 def tail (s : String) (n : Nat) : String :=
   if s.length ≤ n then s else (s.toSubstring.drop (s.length - n)).toString
 
-structure PredReport where
-  name : String
-  path : String
-  line : Nat
-  alreadyConverted : Bool
-  iff : String
-  deriving ToJson, FromJson
-
-/-- The persisted state of a run (`.scratch/codemod/state.json`). -/
+/-- The persisted state of a run. -/
 structure State where
   head : String
-  names : Array String
-  preds : Array Pred
-  predReports : Array PredReport
-  files : Array String
-  nextIndex : Nat
-  repairs : Array RepairRecord
-  /-- `constructor` tactics this run inserted: file, byte offset in the current text. -/
-  inserted : Array (String × Nat) := #[]
-  rounds : Array Json
   stops : Array String
   lintBefore : Json
   timings : Array Timing
@@ -123,11 +101,11 @@ structure State where
 
 structure Env where
   args : Args
+  config : Config
   root : System.FilePath
   logDir : System.FilePath
   state : IO.Ref State
   lintBeforeFindings : IO.Ref (Array String)
-  seen : IO.Ref (Std.HashSet String)
   /-- The alias mode's per-finding results (`stepAlias`). -/
   aliasReport : IO.Ref Json
 
@@ -164,26 +142,31 @@ def git (args : Array String) : M IO.Process.Output := do
   let sa : IO.Process.SpawnArgs := { cmd := "git", args, cwd := (← read).root }
   IO.Process.output sa
 
-/-- `lake build`, then the linter modules the gate builds too. -/
+/-- `lake build` of the default target. -/
 def fullBuild (tag : String) : M (Bool × String) := do
-  let p1 ← runCmd #["lake", "build"] s!"build-{tag}.log"
-  if p1.exitCode != 0 then return (false, p1.stdout ++ p1.stderr)
-  let p2 ← runCmd #["lake", "build", "ArmadaLean.Lint.TypeDoctrine", "ArmadaLean.Lint.TypeDoctrineTest"]
-    s!"build-lint-{tag}.log"
-  return (p2.exitCode == 0, p1.stdout ++ p1.stderr ++ p2.stdout ++ p2.stderr)
+  let p ← runCmd #["lake", "build"] s!"build-{tag}.log"
+  return (p.exitCode == 0, p.stdout ++ p.stderr)
 
-/-- `scripts/type_lint.lean`: the finding lines and the summary. -/
+/-- `Config.lintCommand`, in order: the finding lines and the summary of the
+    last command's standard output. -/
 def typeLint (tag : String) : M (Array String × Json) := do
-  let p ← runCmd #["lake", "env", "lean", "scripts/type_lint.lean"] s!"lint-{tag}.log"
-  let lines := p.stdout.splitOn "\n"
+  let e ← read
+  let cmds := e.config.lintCommand
+  if cmds.isEmpty then stop "the config's lintCommand is empty"
+  let mut out := ""
+  for (args, i) in cmds.zipIdx do
+    let p ← runCmd args s!"lint-{tag}-{i}.log"
+    if p.exitCode != 0 then
+      stop s!"the lint command {" ".intercalate args.toList} failed (exit {p.exitCode}):\n{(tail p.stdout 2000)}\n{(tail p.stderr 2000)}"
+    out := p.stdout
+  let lines := out.splitOn "\n"
   let findings := lines.filter (fun l => l.startsWith "{" && !l.startsWith "{\"summary\"") |>.toArray
   let summaries := lines.filter (·.startsWith "{\"summary\"")
-  if p.exitCode != 0 || summaries.isEmpty then
-    stop s!"scripts/type_lint.lean failed (exit {p.exitCode}):\n{(tail p.stdout 2000)}\n{(tail p.stderr 2000)}"
+  if summaries.isEmpty then stop s!"the lint command printed no summary line:\n{(tail out 2000)}"
   IO.FS.writeFile ((← read).logDir / s!"lint-{tag}.jsonl") ("\n".intercalate findings.toList ++ "\n")
   match Json.parse summaries.getLast! with
   | .ok j => return (findings, j)
-  | .error err => stop s!"type_lint summary is not JSON: {err}"
+  | .error err => stop s!"the lint summary is not JSON: {err}"
 
 /-- A finding line without its `example` field: `repeatedPremise` picks the
     example from the group's uses, and that pick differs between runs. -/
@@ -192,7 +175,7 @@ def findingKey (line : String) : String :=
   | .ok (.obj kvs) => (Json.obj (kvs.erase "example")).compress
   | _ => line
 
--- --- the repair loop --------------------------------------------------------
+-- --- edits -------------------------------------------------------------------
 
 def forbidden : List String := ["sorry", "admit", "axiom", "native_decide"]
 
@@ -204,124 +187,10 @@ def checkForbidden (before after : String) (where_ : String) : M Unit := do
       stop s!"{where_}: the edit would insert `{w}`"
 
 def writeFile (rel : String) (text : String) : M Unit := do
-  if rel.startsWith "ArmadaLean/Spec/" then stop s!"{rel}: the tool never edits ArmadaLean/Spec/"
-  IO.FS.writeFile ((← read).root / rel) text
-
-/-- Shift the predicate offsets of `rel` by the edits just applied to it. -/
-def shiftPreds (rel : String) (edits : Array Edit) : M Unit := do
-  let shift (off : Nat) : Nat := Id.run do
-    let mut o := off
-    for e in edits do
-      if e.stop ≤ off then o := o + e.replacement.utf8ByteSize - (e.stop - e.start)
-    return o
-  modifyState fun s => { s with
-    preds := s.preds.map fun p =>
-      if p.file == rel then { p with declIdOffset := shift p.declIdOffset, holdsOffset := shift p.holdsOffset } else p
-    inserted := s.inserted.map fun (f, o) => if f == rel then (f, shift o) else (f, o) }
-
-def predTexts : M PredTexts := do
   let e ← read
-  let s ← e.state.get
-  let mut m : Std.HashMap String FileMap := {}
-  for p in s.preds do
-    unless m.contains p.file do
-      m := m.insert p.file (FileMap.ofString (← IO.FS.readFile (e.root / p.file)))
-  return { fileMaps := m }
-
-def locOfLink (l : Lsp.LocationLink) : Loc :=
-  { uri := l.targetUri, line := l.targetSelectionRange.start.line, character := l.targetSelectionRange.start.character }
-
-def headsOf (h : Lsp.Heads) : Heads := { head := h.head.map locOfLink, arg := h.arg.map locOfLink }
-
-def mkOracle (c : Lsp.Client) (uri : String) (fm : FileMap) : Oracle :=
-  let pos (off : Nat) : Lsp.Position := fm.utf8PosToLspPos ⟨off⟩
-  { definition := fun off => do return (← c.definition uri (pos off)).map locOfLink
-    expectedHead := fun off => do return (← c.expectedTypeHead uri (pos off)).map headsOf
-    goalHead := fun off => do return headsOf (← c.goalHead uri (pos off))
-    diagExprHeads := fun s e => do
-      return (← c.diagExprHeads uri ⟨pos s, pos e⟩).map headsOf }
-
-/-- Repair one file through the server until it has no error and no silent
-    projection. Returns whether the file changed. -/
-partial def repairFile (c : Lsp.Client) (env : Environment) (rel : String) : M Bool := do
-  let e ← read
-  let uri := Lsp.uriOf e.root rel
-  let text0 ← IO.FS.readFile (e.root / rel)
-  c.open uri text0
-  let rec loop (round : Nat) (text : String) (changed : Bool) : M Bool := do
-    let diags ← c.waitIdle uri
-    let errors := diags.filter (·.severity? == some .error)
-    let parsed ← Parse.parseFile env rel text
-    unless parsed.parseErrors.isEmpty do
-      stop s!"{rel}: the file does not parse: {parsed.parseErrors[0]!}"
-    let fm := parsed.fileMap
-    let trace ← IO.mkRef #[]
-    let st ← e.state.get
-    let ctx : Ctx := { env, parsed, preds := st.preds, predTexts := ← predTexts,
-                       oracle := mkOracle c uri fm, trace,
-                       inserted := st.inserted.filterMap fun (f, o) => if f == rel then some o else none }
-    let mut chosen : Array (Repair × Nat × Nat) := #[]
-    let mut taken : Array Edit := #[]
-    let mut unmatched : Array Json := #[]
-    -- the silent cases first, alone: they change the elaboration upstream of
-    -- the diagnostics, so the diagnostics are decided on the next round
-    for r in (← silentProjections ctx) ++ (← silentUnfolds ctx) ++ (← silentConstructors ctx) do
-      if r.edits.any fun x => taken.any (conflicts x ·) then continue
-      chosen := chosen.push (r, r.edits[0]!.start, 0)
-      taken := taken ++ r.edits
-    let errorsToDecide := if chosen.isEmpty then errors else #[]
-    let ranges := errorsToDecide.map fun d =>
-      let r := d.fullRange?.getD d.range
-      ((fm.lspPosToUtf8Pos r.start).byteIdx, (fm.lspPosToUtf8Pos r.end).byteIdx, d)
-    let sorted := ranges.qsort fun a b => a.1 > b.1 || (a.1 == b.1 && a.2.1 > b.2.1)
-    for (s, en, d) in sorted do
-      let lp := fm.utf8PosToLspPos ⟨s⟩
-      match ← decide ctx s en with
-      | none =>
-        unmatched := unmatched.push (Json.mkObj [("line", toJson (lp.line + 1)), ("col", toJson lp.character), ("message", toJson d.message)])
-      | some r =>
-        if r.edits.any fun x => taken.any (conflicts x ·) then continue
-        let key := s!"{rel}|{r.pattern}|{r.detail}|{(parsed.text.splitOn "\n")[lp.line]!}"
-        if (← e.seen.get).contains key then
-          stop s!"{rel}:{lp.line + 1}:{lp.character}: repair `{r.pattern}` would repeat on `{((parsed.text.splitOn "\n")[lp.line]!).trimAscii}`; the tool stops"
-        chosen := chosen.push (r, s, 0)
-        taken := taken ++ r.edits
-    for line in ← trace.get do c.logLine s!"[decide] {rel} round {round}: {line}"
-    modifyState fun st => { st with rounds := st.rounds.push (Json.mkObj [
-      ("file", toJson rel), ("round", toJson round), ("errors", toJson errors.size),
-      ("repairs", toJson chosen.size), ("unmatched", Json.arr unmatched)]) }
-    if chosen.isEmpty then
-      if errors.isEmpty then
-        c.close uri
-        return changed
-      let u := unmatched[0]!
-      stop s!"{rel}:{u.getObjValD "line"}:{u.getObjValD "col"}: no pattern matches:\n{(u.getObjValD "message").getStr?.toOption.getD ""}"
-    let edits := chosen.flatMap fun (r, _, _) => r.edits
-    let newText := applyEdits text edits
-    checkForbidden text newText rel
-    writeFile rel newText
-    shiftPreds rel edits
-    -- the `constructor`s this round inserts, at their offsets in the new text:
-    -- moved by the edits that end before the insertion point (the insertion
-    -- itself keeps its keyword at that point)
-    let newInserted := chosen.filterMap fun (r, _, _) =>
-      if r.pattern == "constructor" || r.pattern == "constructor-split" then
-        let o := r.edits[0]!.start
-        some (rel, edits.foldl (fun acc e => if e.stop < o then acc + e.replacement.utf8ByteSize - (e.stop - e.start) else acc) o)
-      else none
-    modifyState fun st => { st with inserted := st.inserted ++ newInserted }
-    for (r, s, _) in chosen do
-      let lp := fm.utf8PosToLspPos ⟨s⟩
-      let key := s!"{rel}|{r.pattern}|{r.detail}|{(parsed.text.splitOn "\n")[lp.line]!}"
-      e.seen.modify (·.insert key)
-      let rec_ : RepairRecord :=
-        { file := rel, line := lp.line + 1, col := lp.character, pattern := r.pattern, pred := r.pred, detail := r.detail }
-      modifyState fun st => { st with repairs := st.repairs.push rec_ }
-      log s!"[repair] {rel}:{lp.line + 1}:{lp.character} {r.pattern}: {r.detail}"
-    saveState
-    c.change uri newText
-    loop (round + 1) newText true
-  loop 1 text0 false
+  if e.config.protectedPaths.any (fun p => rel.startsWith p) then
+    stop s!"{rel}: the config protects this path; the tool never edits it"
+  IO.FS.writeFile (e.root / rel) text
 
 -- --- files and dependency order ---------------------------------------------
 
@@ -332,11 +201,11 @@ partial def leanFilesUnder (dir : System.FilePath) : IO (Array System.FilePath) 
     else if entry.path.extension == some "lean" then out := out.push entry.path
   return out
 
-/-- Every candidate file of the checkout, with its module name and imports. -/
-def candidates (root : System.FilePath) : IO (Array (String × Name × Array Name)) := do
-  let mut files : Array System.FilePath := #[root / "ArmadaLean.lean"]
-  files := files ++ (← leanFilesUnder (root / "ArmadaLean"))
-  files := files ++ (← leanFilesUnder (root / "docs" / "counterexamples"))
+/-- Every candidate file under `Config.sourcePrefix`, with its module name
+    and its imports. -/
+def candidates (root : System.FilePath) (sourcePrefix : String) : IO (Array (String × Name × Array Name)) := do
+  let mut files : Array System.FilePath := #[root / (sourcePrefix ++ ".lean")]
+  files := files ++ (← leanFilesUnder (root / sourcePrefix))
   let mut out := #[]
   for f in files do
     let rel := (f.toString.drop (root.toString.length + 1)).copy
@@ -378,101 +247,7 @@ def stepBefore : M Unit := do
   (← read).lintBeforeFindings.set findings
   modifyState fun s => { s with lintBefore := summary }
 
-def importModulesFor (root : System.FilePath) (files : Array String) : IO Environment := do
-  let mut mods : Array Name := #[`ArmadaLean]
-  for rel in files do
-    for m in ← fileImports (root / rel) do
-      unless mods.contains m do mods := mods.push m
-  unsafe importTarget root mods
-
-def stepDiscover (env : Environment) : M Unit := do
-  let e ← read
-  let names := e.args.names
-  let resolved := resolveAll env (names.map String.toName)
-  let mut founds : Array Found := #[]
-  for i in [0:names.size] do
-    let cands := resolved[i]!
-    unless cands.size == 1 do
-      stop s!"discovery: {names[i]!} does not resolve to exactly one ArmadaLean constant: {cands}"
-    let n := cands[0]!
-    let coreCtx : Core.Context := { fileName := "<discovery>", fileMap := default }
-    let found ← match ← (EIO.toIO' ((describe env e.root n).toIO coreCtx { env })) with
-      | .ok (f, _, _) => pure f
-      | .error err => stop s!"discovery: {err}"
-    if found.file.startsWith "ArmadaLean/Spec/" then stop s!"{n} is declared under ArmadaLean/Spec/; refused"
-    let short := (n.toString.splitOn ".").getLast!
-    let g ← git #["grep", "-n", s!"Spec\\.{short}\\b", "--", "ArmadaLean/Spec"]
-    if g.exitCode == 0 && !g.stdout.trimAscii.isEmpty then
-      stop s!"{n}: an approved statement names Spec.{short}; refused:\n{g.stdout}"
-    founds := founds.push found
-  -- conversion, per file
-  let files := founds.foldl (fun acc f => if acc.contains f.file then acc else acc.push f.file) #[]
-  let mut preds : Array Pred := #[]
-  let mut reports : Array PredReport := #[]
-  for rel in files do
-    let text ← IO.FS.readFile (e.root / rel)
-    let fm := FileMap.ofString text
-    let inFile := founds.filter (·.file == rel)
-    let mut edits : Array (Edit × Found × Nat × Nat) := #[]
-    for f in inFile do
-      if f.alreadyConverted then
-        stop s!"{f.name} is already a converted structure with `.iff`; nothing to do"
-      match conversionEdit f text with
-      | .ok (ed, nameOff, holdsOff) => edits := edits.push (ed, f, nameOff, holdsOff)
-      | .error msg => stop msg
-    let newText := applyEdits text (edits.map (·.1))
-    checkForbidden text newText rel
-    writeFile rel newText
-    -- offsets in the new text: shift by the edits that sit before
-    for (ed, f, nameOff, holdsOff) in edits do
-      let delta := edits.foldl (fun d (o, _, _, _) =>
-        if o.stop ≤ ed.start && o != ed then d + o.replacement.utf8ByteSize - (o.stop - o.start) else d) 0
-      let base := ed.start + delta
-      let explicit := f.binders.filter (·.explicit) |>.toList.flatMap (·.names.toList)
-      let pred : Pred :=
-        { fullName := f.name.toString, declId := f.declId, file := rel,
-          uri := Lsp.uriOf e.root rel, declIdOffset := base + nameOff, holdsOffset := base + holdsOff,
-          bodyHead := f.bodyHead, bodyIsStructure := f.bodyIsStructure }
-      preds := preds.push pred
-      let rep : PredReport :=
-        { name := f.name.toString, path := rel, line := (fm.toPosition ⟨f.defStart⟩).line,
-          alreadyConverted := false, iff := " ".intercalate (f.declId :: explicit) ++ " ↔ …" }
-      reports := reports.push rep
-  modifyState fun s => { s with preds, predReports := reports }
-
-def stepFiles (env : Environment) : M Unit := do
-  let e ← read
-  let s ← e.state.get
-  let c ← Lsp.start e.root (e.logDir / "lsp.log")
-  let mut i := s.nextIndex
-  let files := s.files
-  let result ← tryCatch (do
-    let mut i := i
-    while i < files.size do
-      let rel := files[i]!
-      log s!"[file] {rel} ({i + 1}/{files.size})"
-      let changed ← repairFile c env rel
-      if changed && rel.startsWith "ArmadaLean" then
-        let m := moduleName rel
-        let p ← runCmd #["lake", "build", m.toString] s!"build-{m}.log"
-        if p.exitCode != 0 then
-          stop s!"lake build {m} failed after the repairs:\n{(tail (p.stdout ++ p.stderr) 3000)}"
-        let ilean := e.root / ".lake" / "build" / "lib" / "lean" / ((rel.dropEnd 5).copy ++ ".ilean")
-        c.ileanChanged ilean
-      i := i + 1
-      modifyState fun st => { st with nextIndex := i }
-      saveState
-    pure (Except.ok ()))
-    (fun err => pure (Except.error err))
-  i := i
-  c.stop
-  match result with
-  | .ok () => pure ()
-  | .error err => throw err
-
--- --- the alias mode -------------------------------------------------------------
-
-/-- One declaration of the alias work list and its result. -/
+/-- One work-list entry and its result. -/
 structure AliasUnit where
   decl : Name
   file : String
@@ -497,12 +272,12 @@ def aliasResults (units : Array AliasUnit) : Json :=
 
 /-- Build every module among `files[0:upto]` whose text on disk is not the
     text of its last build. -/
-def buildUpTo (files : Array String) (upto : Nat) (disk built : Std.HashMap String String) :
+def buildUpTo (files : Array String) (upto : Nat) (sourcePrefix : String) (disk built : Std.HashMap String String) :
     M (Std.HashMap String String) := do
   let mut built := built
   for k in [0:upto] do
     let rel := files[k]!
-    unless rel.startsWith "ArmadaLean" do continue
+    unless rel.startsWith sourcePrefix do continue
     let t := disk.getD rel ""
     if built.get? rel != some t then
       let m := moduleName rel
@@ -511,7 +286,7 @@ def buildUpTo (files : Array String) (upto : Nat) (disk built : Std.HashMap Stri
       built := built.insert rel t
   return built
 
-/-- The alias mode (`--alias`), one declaration at a time, the last
+/-- The alias pass (`--alias`), one declaration at a time, the last
     declaration of the last file first (a caller before its callee: the
     caller's arguments are then the right-hand side, not its own variable).
     For each declaration: an in-process elaboration of its file and of every
@@ -524,9 +299,8 @@ def buildUpTo (files : Array String) (upto : Nat) (disk built : Std.HashMap Stri
     modules. -/
 def stepAlias : M Unit := do
   let e ← read
-  let some wl := e.args.alias | stop "--alias: no work list"
-  let some replPath := e.args.repl | stop "--alias needs --repl PATH (the Lean REPL)"
-  let findings ← match Json.parse (← IO.FS.readFile wl) >>= fun j => do (← j.getArr?).mapM Alias.Finding.ofJson with
+  let sourcePrefix := e.config.sourcePrefix
+  let findings ← match Json.parse (← IO.FS.readFile e.args.alias) >>= fun j => do (← j.getArr?).mapM Alias.Finding.ofJson with
     | .ok fs => pure fs
     | .error err => stop s!"the work list is not valid: {err}"
   let mut units : Array AliasUnit := #[]
@@ -537,11 +311,11 @@ def stepAlias : M Unit := do
       let line := ((f.at_.splitOn ":")[1]?.bind String.toNat?).getD 0
       units := units.push { decl := f.declaration.toName, file := f.file, line, findings := #[f] }
   -- the files: each declaration's file and every file that names it, in import order
-  let cands ← candidates e.root
+  let cands ← candidates e.root sourcePrefix
   let mut mentioned : Std.HashSet String := {}
   for u in units do
     mentioned := mentioned.insert u.file
-    let g ← git #["grep", "-lw", u.short, "--", "ArmadaLean.lean", "ArmadaLean", "docs/counterexamples"]
+    let g ← git #["grep", "-lw", u.short, "--", sourcePrefix ++ ".lean", sourcePrefix]
     for l in g.stdout.splitOn "\n" do
       if l ≠ "" then mentioned := mentioned.insert l
   let files := (dependents cands (units.map fun u => moduleName u.file)).filter mentioned.contains
@@ -555,7 +329,7 @@ def stepAlias : M Unit := do
   initSearchPath (← findSysroot s!"{home}/.elan/bin/lean") sp
   let mut disk : Std.HashMap String String := {}
   for rel in files do disk := disk.insert rel (← IO.FS.readFile (e.root / rel))
-  let c ← Repl.start replPath sp (e.logDir / "repl.log")
+  let c ← Repl.start e.args.repl sp (e.logDir / "repl.log")
   let secs (t0 : Nat) : IO Float := do return (Float.ofNat ((← IO.monoMsNow) - t0)) / 1000.0
   let result ← tryCatch (do
     let mut units := units
@@ -577,7 +351,7 @@ def stepAlias : M Unit := do
       log s!"[alias] {u.decl}{if k ≥ order.size then " (second pass)" else ""}"
       let uFiles := files.filter fun rel => rel == u.file || ((disk.getD rel "").splitOn u.short).length > 1
       -- analysis on the current texts
-      built ← buildUpTo files (fileIdx u.file) disk built
+      built ← buildUpTo files (fileIdx u.file) sourcePrefix disk built
       let elabFile (rel : String) : M Alias.FileElab := do
         let t0 ← IO.monoMsNow
         let fe ← Alias.elabText (e.root / rel).toString (moduleName rel) (disk.getD rel "")
@@ -601,15 +375,15 @@ def stepAlias : M Unit := do
       let mut problem : Option String := none
       for rel in uFiles do
         let fe' ← if rel == u.file then pure fe else do
-          built ← buildUpTo files (fileIdx rel) disk built
+          built ← buildUpTo files (fileIdx rel) sourcePrefix disk built
           elabFile rel
         unless fe'.env.contains u.decl do continue
         let sk := if rel == u.file then skip else (0, 0)
         let s ← Alias.callSites fe' u.decl pairs sk "" de.moved
         let sc ← Alias.callSites fe' u.decl pairs sk ReplCheck.suffix de.moved
         if let some pr := s.problem then problem := some s!"{rel}:{pr}"
-        if !s.argCasts.isEmpty && (rel.startsWith "ArmadaLean/Spec/" || rel.startsWith "ArmadaLean/Lint/") then
-          problem := some s!"{rel}: a call site is under ArmadaLean/Spec/ or ArmadaLean/Lint/"
+        if !s.argCasts.isEmpty && e.config.protectedPaths.any (fun p => rel.startsWith p) then
+          problem := some s!"{rel}: a call site is under a protected path"
         sites := sites.push (rel, s, sc)
         if rel != u.file then elabs := elabs.push (rel, fe')
       if let some pr := problem then
@@ -719,7 +493,7 @@ def stepAlias : M Unit := do
       | none => units := units.set! ui { u with attempts }
       e.aliasReport.set (aliasResults units)
     -- the real check of the REPL's verdicts: one build of the changed modules
-    let mods := changedFiles.filter (·.startsWith "ArmadaLean") |>.map fun rel => (moduleName rel).toString
+    let mods := changedFiles.filter (·.startsWith sourcePrefix) |>.map fun rel => (moduleName rel).toString
     unless mods.isEmpty do
       let p ← runCmd (#["lake", "build"] ++ mods) "build-alias-changed.log"
       if p.exitCode != 0 then
@@ -736,15 +510,8 @@ def stepAfter : M Unit := do
   let (ok, out) ← fullBuild "after"
   unless ok do stop ("the repaired tree does not build:\n" ++ (tail out 3000))
   let (findings, summary) ← typeLint "after"
-  -- the alias mode changes nothing under `scripts/` outside `scripts/codemod/`
-  let hashes ← if e.args.alias.isSome then pure Json.null else
-    let pyArgs : IO.Process.SpawnArgs :=
-      { cmd := "python3", args := #["scripts/update_gate_baseline.py", "--hashes-only"], cwd := e.root }
-    let p ← IO.Process.output pyArgs
-    pure (Json.mkObj [("exit", toJson p.exitCode.toNat), ("stderr", toJson (tail p.stderr 1000))])
   let head := (← e.state.get).head
-  let base := if e.args.alias.isSome then #["--base", head] else #[]
-  let chk ← runCmd (#["bash", "scripts/check.sh", "--json"] ++ base) "check.log"
+  let chk ← runCmd (e.config.checkCommand ++ #["--base", head]) "check.log"
   let checkJson := match (chk.stdout.trimAscii.copy.splitOn "\n").getLast? >>= fun l => (Json.parse l).toOption with
     | some j => j
     | none => Json.mkObj [("error", toJson ((tail chk.stdout 2000) ++ (tail chk.stderr 2000)))]
@@ -759,12 +526,10 @@ def stepAfter : M Unit := do
   let added := (after.filter (!bset.contains ·)).qsort (· < ·)
   let s ← e.state.get
   let report := Json.mkObj [
-    ("checkout", toJson e.root.toString), ("head", toJson s.head), ("names", toJson s.names),
+    ("checkout", toJson e.root.toString), ("head", toJson s.head),
     ("stopped", Json.null), ("stops", toJson s.stops),
-    ("predicates", toJson s.predReports), ("repairs", toJson s.repairs), ("rounds", Json.arr s.rounds),
     ("lint_before", s.lintBefore), ("lint_after", summary),
     ("findings_removed", toJson removed), ("findings_added", toJson added),
-    ("gate_baseline_hashes", hashes),
     ("check", okFields), ("check_full", checkJson),
     ("files_changed", toJson ((← git #["status", "--porcelain"]).stdout.splitOn "\n" |>.filter (· ≠ "") |>.map (·.drop 3 |>.copy))),
     ("alias", ← e.aliasReport.get),
@@ -777,67 +542,38 @@ def writeStopReport (msg : String) : M Unit := do
   modifyState fun st => { st with stops := st.stops.push msg }
   saveState
   let report := Json.mkObj [
-    ("checkout", toJson e.root.toString), ("head", toJson s.head), ("names", toJson s.names),
-    ("stopped", toJson msg), ("stops", toJson s.stops), ("predicates", toJson s.predReports),
-    ("repairs", toJson s.repairs), ("rounds", Json.arr s.rounds), ("lint_before", s.lintBefore),
+    ("checkout", toJson e.root.toString), ("head", toJson s.head),
+    ("stopped", toJson msg), ("stops", toJson s.stops), ("lint_before", s.lintBefore),
     ("files_changed", toJson ((← git #["status", "--porcelain"]).stdout.splitOn "\n" |>.filter (· ≠ "") |>.map (·.drop 3 |>.copy))),
     ("alias", ← e.aliasReport.get),
     ("timings", toJson s.timings)]
   IO.FS.writeFile e.args.report (report.pretty ++ "\n")
 
 def run : M Unit := do
-  let e ← read
-  if e.args.alias.isSome then
-    stepBefore
-    stepAlias
-    stepAfter
-    return
-  if !e.args.resume then
-    stepBefore
-  let cands ← candidates e.root
-  if !e.args.resume then
-    let env ← importModulesFor e.root (cands.map (·.1))
-    stepDiscover env
-    let roots := (← e.state.get).preds.map fun p => moduleName p.file
-    let files := dependents cands roots
-    modifyState fun s => { s with files, nextIndex := 0 }
-    saveState
-    stepFiles env
-  else
-    let env ← importModulesFor e.root (cands.map (·.1))
-    stepFiles env
+  stepBefore
+  stepAlias
   stepAfter
 
-end DefToStructure
+end LeanTemper
 
-open DefToStructure in
+open LeanTemper in
 unsafe def main (argv : List String) : IO UInt32 := do
   let args ← match parseArgs argv with
     | .ok a => pure a
+    | .error msg => IO.eprintln msg; return 2
+  let config ← match ← loadConfig args.config with
+    | .ok c => pure c
     | .error msg => IO.eprintln msg; return 2
   let root := (← IO.FS.realPath args.checkout)
   let logDir := root / ".scratch" / "codemod"
   IO.FS.createDirAll logDir
   let gitArgs : IO.Process.SpawnArgs := { cmd := "git", args := #["rev-parse", "HEAD"], cwd := root }
   let head := (← IO.Process.output gitArgs).stdout.trimAscii.copy
-  let initial : State :=
-    { head, names := args.names, preds := #[], predReports := #[], files := #[], nextIndex := 0,
-      repairs := #[], rounds := #[], stops := #[], lintBefore := Json.null, timings := #[] }
-  let state ← if args.resume then
-      match Json.parse (← IO.FS.readFile (logDir / "state.json")) >>= fromJson? (α := State) with
-      | .ok s => pure s
-      | .error err => IO.eprintln s!"--resume: cannot read state.json: {err}"; return 2
-    else pure initial
-  let lintBefore ← if args.resume then
-      let text ← IO.FS.readFile (logDir / "lint-before.jsonl")
-      pure ((text.splitOn "\n").filter (·.startsWith "{")).toArray
-    else pure #[]
+  let state : State := { head, stops := #[], lintBefore := Json.null, timings := #[] }
   let stateRef ← IO.mkRef state
-  let lintRef ← IO.mkRef lintBefore
-  let seenRef ← IO.mkRef ({} : Std.HashSet String)
+  let lintRef ← IO.mkRef (#[] : Array String)
   let aliasRef ← IO.mkRef Json.null
-  let env : Env := { args, root, logDir, state := stateRef, lintBeforeFindings := lintRef, seen := seenRef,
-                     aliasReport := aliasRef }
+  let env : Env := { args, config, root, logDir, state := stateRef, lintBeforeFindings := lintRef, aliasReport := aliasRef }
   match ← (run.run env).run with
   | .ok () => return 0
   | .error ⟨msg⟩ =>
