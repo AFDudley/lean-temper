@@ -347,10 +347,18 @@ intended strict difference. It is not acceptable yet, for four reasons:
 
 - **Speed.** The decision-scope check starts one `lake env lean` process per model file, so the
   gate takes 12–20 minutes instead of 1–2. The fix is to run the `DecisionScope` linter inside
-  the normal `lake build` through a package option, so each module is checked once and
-  incrementally. Elaborating the files again inside the gate's own environment does not work:
-  that environment already holds their declarations. The acceptance limit is that, on a warm
-  tree, the port is no slower than the Python gate.
+  the normal `lake build`. A command linter runs only in a compile whose import closure holds
+  the linter's module, so a package option alone does nothing. Each model module's own compile
+  must therefore load `ArmadaLean.Lint.DecisionScope`. An import in the root `ArmadaLean.lean` is
+  not enough: the root imports the model modules, and they do not import the root. Two
+  mechanisms remain. A base module that every model file already imports can import the linter.
+  Or Lake's `plugins` option can load the compiled linter into each `lean` process, so that its
+  `initialize` registers the linter with no edit to a model file (to be verified on Lake 4.35).
+  Each compile then records its findings in its `.olean` (`Linter.recordLints`,
+  `Lean/Elab/Frontend.lean:388`). The gate reads them with `Linter.getAllLints` and elaborates
+  nothing again. Elaborating the files again inside the gate's own environment is wrong: that
+  environment already holds their declarations. The acceptance limit is that, on a warm tree,
+  the port is no slower than the Python gate.
 - **Scan count.** The port reports 902 scanned files, but the model has 93.
 - **Unverified claims.** The port claims that a large `unsafe def main` links to the wrong
   entry point, and it turned off `enableArtifactCache` for the whole package. Both need a
