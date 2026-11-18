@@ -231,17 +231,14 @@ structure Pair where
 def Pair.inStatement (p : Pair) : Bool := p.vGroup.isNone || p.hvGroup.isNone
 
 /-- The edits of one declaration. `sig`: the binder deletions and the
-    substitutions in the signature. The proof has three forms: `proof`, the
+    substitutions in the signature. The proof has two forms: `proof`, the
     occurrences of `v` and `hv` in the proof replaced (`v` by `rhs`, a
-    rewrite or `subst` with `hv` deleted, another `hv` by `rfl`);
-    `restated`, the proof text kept behind
-    `suffices h : ∀ (v : T) (hv : v = rhs) (h₁ : T₁ v) …, OLD from h _ rfl h₁ …; intro v hv h₁ …`
-    (the context and the goal of the old proof exactly); and `preamble`,
-    the proof text kept behind `generalize`. -/
+    rewrite or `subst` with `hv` deleted, another `hv` by `rfl`); and
+    `preamble`, the proof text kept behind `generalize`. No form restates the
+    old statement: a copy of it is a deprecated copy (repair pass R.5). -/
 structure DeclEdits where
   sig : Array Edit
   proof : Except String (Array Edit)
-  restated : Option Edit
   preamble : Option Edit
   /-- The proof names `v` or `hv`. -/
   proofNames : Bool
@@ -647,7 +644,7 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
       moved := moved ++ parts.groups[gi]!.idents.map identName
   let sig := deletions fe.text del ++ subst ++ moves
   let inStatement := pairs.any (·.inStatement)
-  -- the statement's own binders change the proof's `intro`s: only `restated` keeps the proof
+  -- the statement's own binders change the proof's `intro`s: no form handles that yet
   if inStatement then proof := .error "`v` or `hv` is part of the statement: the proof's `intro`s depend on them"
   let preamble : Option Edit := Id.run do
     if inStatement then return none
@@ -659,79 +656,7 @@ def declEdits (fe : FileElab) (d : Name) (fs : Array Finding) : Except String De
       text := text ++ s!"generalize {p.hv} : {p.rhsText} = {p.v}{loc}; "
       if p.vLeft then text := text ++ s!"replace {p.hv} := {p.hv}.symm; "
     return some { start := ps, stop := ps, replacement := if tactic then text else s!"by {text}exact " }
-  -- `suffices`: the old statement over `v`, `hv` and the binders whose types
-  -- name `v`, proved by the old proof; one line before the first tactic
-  let restated : Option Edit := Id.run do
-    let some (start, true) := proofStart? parts.value | return none
-    let some (ps, _) := rng? start | return none
-    let some (ts, te) := rng? parts.type | return none
-    let typeText := slice fe.text ts te
-    if (typeText.splitOn "--").length > 1 then return none
-    let cmdText := slice fe.text cs ce
-    let h := if (cmdText.splitOn "hAlias").length > 1 then "hAlias'" else "hAlias"
-    let mut binders : Array String := #[]
-    let mut args : Array String := #[]
-    let mut intros : Array String := #[]
-    for g in parts.groups do
-      let some (gs, ge) := rng? g.stx | continue
-      let some t := g.type? | continue
-      let some (tts, tte) := rng? t | continue
-      let tText := slice fe.text tts tte
-      if let some p := pairs.find? (fun p => p.hvGroup.any (rng? ·.stx == some (gs, ge))) then
-        binders := binders.push s!"({p.hv} : {tText})"
-        args := args.push "rfl"
-        intros := intros.push p.hv
-        continue
-      for i in g.idents do
-        if pairs.any (fun p => p.vGroup.isSome && rng? p.vIdent == rng? i) then
-          binders := binders.push s!"({identName i} : {tText})"
-          args := args.push "_"
-          intros := intros.push (identName i)
-      if subst.any (fun ed => gs ≤ ed.start && ed.stop ≤ ge) then
-        if g.idents.isEmpty || g.idents.any (!·.isIdent) then return none
-        let ns := g.idents.map identName
-        binders := binders.push s!"({" ".intercalate ns.toList} : {tText})"
-        args := args ++ ns
-        intros := intros ++ ns
-    -- the statement's binders up to its last `hv`: introduced, then passed on
-    let stmt := pairs.filter (·.hvGroup.isNone)
-    let mut fromTerm := s!"{h} {" ".intercalate args.toList}"
-    unless stmt.isEmpty do
-      let some ci := fe.env.find? d | return none
-      let names := ((binderNames fe.env d).getD #[]).map (·.eraseMacroScopes.toString (escape := false))
-      let doms := (telescope ci.type names.size).1
-      -- the position after the declaration's binders
-      let mut m := 0
-      for nm in parts.groups.flatMap (·.idents.map identName) do
-        while m < names.size && names[m]! != nm do m := m + 1
-        m := m + 1
-      let mut ivs : Array Nat := #[]
-      let mut ihs : Array Nat := #[]
-      for p in stmt do
-        let iv? := if p.vGroup.isSome then names.idxOf? p.v
-          else (List.range names.size).find? fun k => k ≥ m && names[k]! == p.v
-        let some iv := iv? | return none
-        let some ih := eqIndexAfter doms (max iv (m - 1)) iv | return none
-        if p.vGroup.isNone then ivs := ivs.push iv
-        ihs := ihs.push ih
-      let top := ihs.foldl max 0
-      let mut xs : Array String := #[]
-      let mut sargs : Array String := #[]
-      for k in [m:top + 1] do
-        if ihs.contains k then sargs := sargs.push "rfl"
-        else if ivs.contains k then sargs := sargs.push "_"
-        else
-          xs := xs.push s!"{h}_{k - m}"
-          sargs := sargs.push s!"{h}_{k - m}"
-      let call := s!"{h} {" ".intercalate (args ++ sargs).toList}"
-      fromTerm := if xs.isEmpty then s!"({call})" else s!"(by intro {" ".intercalate xs.toList}; exact {call})"
-    let quant := if binders.isEmpty then "" else s!"∀ {" ".intercalate binders.toList}, "
-    let introPart := if intros.isEmpty then "" else s!"intro {" ".intercalate intros.toList}; "
-    let text := s!"suffices {h} : {quant}{typeText} from {fromTerm}; {introPart}"
-    -- one line: the line breaks of the copied texts become spaces
-    let oneLine := " ".intercalate ((text.splitOn "\n").map (·.trimAsciiStart.copy))
-    return some { start := ps, stop := ps, replacement := oneLine }
-  return { sig, proof := proof >>= nest, preamble, restated, proofNames := names, pairs, declIdEnd,
+  return { sig, proof := proof >>= nest, preamble, proofNames := names, pairs, declIdEnd,
            valueRange := (valStart, valStop), isTheorem := decl.isOfKind ``Parser.Command.theorem, moved }
 
 /-- The hoist of a statement's leading `∀ x y : T,` into the declaration's

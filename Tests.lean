@@ -400,7 +400,7 @@ compares the text, and elaborates the result: it must have no error. -/
 
 /-- The proof form of a case. -/
 inductive ProofForm where
-  | unchanged | substituted | restated | generalized
+  | unchanged | substituted | generalized
 
 structure AliasCase where
   name : String
@@ -442,14 +442,6 @@ def aliasCases : List AliasCase := [
     src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
     proof := .generalized,
     want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  generalize hb : (a + 1) = b at h ⊢; replace hb := hb.symm; subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
-  { name := "the proof kept behind `suffices` over v, hv and the binders that name v",
-    src := bazSrc "theorem use4 : (3 : Nat) ≠ 0 := baz 2 3 rfl (by decide)\n", decl := `baz, binders := #["b"],
-    proof := .restated,
-    want := "theorem baz (a : Nat) (h : 0 < (a + 1)) : (a + 1) ≠ 0 := by\n  suffices hAlias : ∀ (b : Nat) (hb : b = a + 1) (h : 0 < b), b ≠ 0 from hAlias _ rfl h; intro b hb h; subst hb\n  exact Nat.pos_iff_ne_zero.mp h\n\ntheorem use4 : (3 : Nat) ≠ 0 := baz 2 (by decide)\n" },
-  { name := "v and hv in the statement (`∀ n W, W.length = n → …`), the proof behind `suffices`",
-    src := "theorem topo : ∀ n (W : List Nat), W.length = n → W.length ≤ n := by\n  intro n\n  induction n with\n  | zero => intro W h; omega\n  | succ k ih => intro W h; omega\n\ntheorem useT (W : List Nat) : W.length ≤ W.length := topo _ W rfl\n",
-    decl := `topo, binders := #["n"], proof := .restated,
-    want := "theorem topo : ∀ (W : List Nat), W.length ≤ W.length := by\n  suffices hAlias : ∀ n (W : List Nat), W.length = n → W.length ≤ n from (by intro hAlias_1; exact hAlias _ hAlias_1 rfl); intro n\n  induction n with\n  | zero => intro W h; omega\n  | succ k ih => intro W h; omega\n\ntheorem useT (W : List Nat) : W.length ≤ W.length := topo W\n" },
   { name := "a caller with its own variable for v: argument casts",
     src := bazSrc "theorem use5 (k : Nat) (hk : k = 2 + 1) (h : 0 < k) : k ≠ 0 := baz 2 k hk h\n", decl := `baz,
     binders := #["b"], proof := .substituted,
@@ -510,12 +502,7 @@ def extraAliasCases : List AliasCase := [
   { name := "an implicit argument that is no local variable: its printed value as a named argument",
     src := "def hc (p : Nat) : Nat := p + 1\n\ndef Cons (r : Nat → Nat) : Prop := True\n\ndef recStep (r : Nat → Nat) (c p : Nat) : Nat → Nat := fun x => if x = c then p else r x\n\ntheorem callee3 {r : Nat → Nat} (hr : Cons r) {c : Nat} {p : Nat} (hv : hc p = c) : Cons (recStep r c p) := trivial\n\ntheorem caller3 (r : Nat → Nat) (hr : Cons r) (cs ps : Nat → Nat) (hvalid : ∀ i, hc (ps i) = cs i) (i : Nat) :\n    Cons (recStep r (cs i) (ps i)) := callee3 hr (hvalid i)\n",
     decl := `callee3, binders := #["c"], proof := .unchanged, rewrite := true,
-    want := "def hc (p : Nat) : Nat := p + 1\n\ndef Cons (r : Nat → Nat) : Prop := True\n\ndef recStep (r : Nat → Nat) (c p : Nat) : Nat → Nat := fun x => if x = c then p else r x\n\ntheorem callee3 {r : Nat → Nat} (hr : Cons r) {p : Nat} : Cons (recStep r (hc p) p) := trivial\n\ntheorem caller3 (r : Nat → Nat) (hr : Cons r) (cs ps : Nat → Nat) (hvalid : ∀ i, hc (ps i) = cs i) (i : Nat) :\n    Cons (recStep r (cs i) (ps i)) := (by have hAlias := callee3 hr (p := (ps i)); rewrite [(hvalid i)] at hAlias; exact hAlias)\n" },
-  -- class 6: `rhs` names variables of the statement's leading `∀`
-  { name := "rhs names variables of the statement's `∀`: they become binders, then move before `hord`",
-    src := "theorem aux (order : List Nat) (hord : order.length = order.length) (d : Nat) :\n    ∀ suf pre : List Nat, order = pre ++ suf → (pre ++ suf).length + d = order.length + d := by\n  intro suf\n  induction suf with\n  | nil => intro pre h; rw [h]\n  | cons c rest ih => intro pre h; rw [h]\n\ntheorem useAux (l : List Nat) : ([] ++ l).length + 0 = l.length + 0 := aux l rfl 0 l [] rfl\n",
-    decl := `aux, binders := #["order"], proof := .restated,
-    want := "theorem aux (suf pre : List Nat) (hord : (pre ++ suf).length = (pre ++ suf).length) (d : Nat) :\n    (pre ++ suf).length + d = (pre ++ suf).length + d := by\n  suffices hAlias : ∀ (order : List Nat) (hord : order.length = order.length), order = pre ++ suf → (pre ++ suf).length + d = order.length + d from (hAlias _ hord rfl); intro order hord; suffices hHoist : ∀ suf pre : List Nat, order = pre ++ suf → (pre ++ suf).length + d = order.length + d from hHoist suf pre; intro suf\n  induction suf with\n  | nil => intro pre h; rw [h]\n  | cons c rest ih => intro pre h; rw [h]\n\ntheorem useAux (l : List Nat) : ([] ++ l).length + 0 = l.length + 0 := aux l [] rfl 0\n" } ]
+    want := "def hc (p : Nat) : Nat := p + 1\n\ndef Cons (r : Nat → Nat) : Prop := True\n\ndef recStep (r : Nat → Nat) (c p : Nat) : Nat → Nat := fun x => if x = c then p else r x\n\ntheorem callee3 {r : Nat → Nat} (hr : Cons r) {p : Nat} : Cons (recStep r (hc p) p) := trivial\n\ntheorem caller3 (r : Nat → Nat) (hr : Cons r) (cs ps : Nat → Nat) (hvalid : ∀ i, hc (ps i) = cs i) (i : Nat) :\n    Cons (recStep r (cs i) (ps i)) := (by have hAlias := callee3 hr (p := (ps i)); rewrite [(hvalid i)] at hAlias; exact hAlias)\n" } ]
 
 def runAliasCase (c : AliasCase) : IO Bool := do
   let fe0 ← Alias.elabText "t.lean" `t c.src
@@ -536,7 +523,6 @@ def runAliasCase (c : AliasCase) : IO Bool := do
       return false
     let proof ← match c.proof, de.proof with
       | .unchanged, _ => pure #[]
-      | .restated, _ => pure de.restated.toArray
       | .generalized, _ => pure de.preamble.toArray
       | .substituted, .ok eds => pure eds
       | .substituted, .error msg => do

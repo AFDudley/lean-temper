@@ -633,7 +633,6 @@ def stepAlias : M Unit := do
       else match de.proof with
         | .ok eds => proofForms := proofForms.push ("proof substituted", eds)
         | .error msg => attempts := attempts.push ("proof substituted", msg)
-      if let some r := de.restated then proofForms := proofForms.push ("proof behind suffices", #[r])
       if let some p := de.preamble then proofForms := proofForms.push ("proof behind generalize", #[p])
       let castsDiffer := sites.any fun (_, s, _) => s.argCasts != s.callCast
       let mut callForms : Array String := if castsDiffer then #["argument casts", "call cast"] else #["plain calls"]

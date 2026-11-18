@@ -163,9 +163,9 @@ Not handled (reported as not fixed): `v` or `hv` bound in the statement
 - `Tests.lean`: 55 cases of the decision (the 43 recorded cases of the first
   tool, the silent projection, the parenthesized-receiver goal, the two
   applications under `unfold`, the negation cases and the `Decidable` instances),
-  9 alias cases (an implicit argument, a named argument, dot notation,
-  a proof that names `v` and `hv`, the `generalize` form, the `suffices`
-  forms, the two cast forms), and the REPL check (a caller in `D`'s scope and
+  alias cases (an implicit argument, a named argument, dot notation,
+  a proof that names `v` and `hv`, the `generalize` form, the cast forms),
+  and the REPL check (a caller in `D`'s scope and
   one in another scope; a right candidate, a wrong proof, wrong callers).
 - `scope.lean`: scope measurement, `lake env lean scope.lean` in a built
   checkout.
