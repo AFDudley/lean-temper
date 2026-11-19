@@ -370,9 +370,15 @@ accepted the result. For armada-lean, each step must meet three conditions:
 3. The project's strict gate (`scripts/check.sh`) fails only on findings outside the step's
    scope, and no count is higher than before the step.
 
-The strict gate passes only when the model has no finding at all. The steps therefore
-accumulate on one branch. The merge through the project's own process happens once, after the
-last step, when the gate passes. That merge completes the work.
+**Each merge into armada-lean meets the GATE of `armada-laconic/docs/process.md`.** Operator
+ruling, 2026-11-19: where `process.md` and this document differ, `process.md` governs. Its
+GATE says "Every step merges on its own". At each merge, no type-doctrine count rises
+(`scripts/check.sh`, `lint_ok`), and the net line change of the model code is at most 0. So a
+merge happens only at a point where the result has no adapter. The `alias` pass leaves
+adapters (section 5.1), so its result merges only together with the `alias-proof` result for
+the same findings. In lean-temper, the two passes are separate build steps. On armada-lean,
+they are one merge. The strict gate passes only when the model has no finding at all, so the
+strict gate itself merges after the last step (section 10).
 
 **The gate must see inside proofs.** armada-lean's type-doctrine linter checks statements only.
 Nothing in it inspects a proof body. So a proof that keeps an alias through an adapter (any form
@@ -401,13 +407,15 @@ any time. The other steps share the types of the pass manager, so step 1 defines
 first. After that, steps 2, 3, 4 and 6 can be developed at the same time. Runs on the model
 happen in the fixed pass order, because the passes edit the same files.
 
-**Step 1 measures the wrong thing if it rewrites proofs.** Between 2026-11-18 and 2026-11-19,
-the proof-rewriting work that belongs to step 2 was put into step 1, and step 1's acceptance
-counted how many proofs survived it. See `docs/labbook/2026-11-19-alias-transport-and-step-split.md`.
-Step 1 is measured by statements: each finding's alias is gone from the statement and the
-signature, and Lean accepts the change set. Its adapters add lines, so the model's line count
-is not a step-1 criterion. Step 2 is measured by proofs: the proof-level rule reports nothing,
-and the model's line count after step 2 is no higher than before step 1.
+**Steps 1 and 2 have one merge.** Between 2026-11-18 and 2026-11-19, the proof-rewriting work
+that belongs to step 2 was put into step 1, and step 1's acceptance counted how many proofs
+survived it. See `docs/labbook/2026-11-19-alias-transport-and-step-split.md`. During
+development, step 1 is measured by statements: each finding's alias is gone from the statement
+and the signature, and Lean accepts the change set. Step 1's adapters add lines, so its result
+does not merge alone. Step 2 is measured by proofs: the proof-level rule reports nothing. The
+merge into armada-lean takes the result of both steps for the same findings, and it meets the
+GATE of section 9: no type-doctrine count rises, the net line change of the model code is at
+most 0, and no adapter remains. Steps 3 to 6 each merge on their own, under the same GATE.
 
 **The strict gate of armada-lean waits for the last step.** It fails on any finding, so it
 can merge only when the steps above bring armada-lean to zero findings. Until then, each step
