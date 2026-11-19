@@ -92,7 +92,15 @@ missing fact.
 
 **The linter decides when a pass is complete.** A pass is complete when its linter reports
 no finding. If a finding remains, the run fails. The project's own gate then checks the
-result independently.
+result independently. A linter can only enforce what it can see, so each pass's linter must
+check the pass's actual goal. A linter that checks statements cannot show that a proof is free
+of aliases. That needs its own rule, which inspects proof bodies (section 9).
+
+**A pass covers every instance of its pattern.** A pass rule never says "where it can". If an
+instance of the pattern exists that the pass does not rewrite, that is a defect in the pass:
+the run reports the instance, with the tactic or construct involved and Lean's error, and
+fails. An instance is never left in place as an accepted exception, and no adapter is left in
+the merged result to hide it.
 
 **The output is deterministic.** The same input always gives the same output. When the
 doctrine leaves a choice open, for example the name of a new type, a fixed rule makes the
@@ -148,48 +156,96 @@ The passes run in this order: `alias`, `alias-proof`, `variant`, `refine`, `clea
 **Pattern.** A declaration takes a variable `v` and a hypothesis `hv : v = e`, where `e` is
 built from other variables and does not mention `v`.
 
-**Rewrite.** On the Syntax tree of the declaration, the pass deletes the binder nodes of `v`
-and `hv`. It replaces each identifier node that elaborated to `v` with the Syntax node of `e`,
-and each identifier node that elaborated to `hv` with `rfl`. This holds in the statement and
-in the proof. At every call site, it deletes the argument nodes that elaborated to the
-arguments at the positions of `v` and `hv`. The info tree identifies each of these nodes. If
-Lean refuses the result, the declaration stays unchanged and the failure is reported.
+**Scope.** This pass removes the alias from statements, signatures and call sites. It does not
+rewrite proofs. It carries each old proof across unchanged, with an adapter, and section 5.2
+then removes every adapter. The output of this pass is therefore intermediate, in the way a
+compiler's intermediate code is: Lean checks it, but it is never the merged result.
 
-**Example.**
+**Case 1: `hv` is unused in the proof.** (A `clear hv` counts as no use.) The pass deletes
+`hv`, keeps `v` as an ordinary variable, deletes the `clear`, and at each call site deletes
+only the argument for `hv`. The statement becomes more general, and the proof needs no change.
+
+**Case 2: `hv` is used.** The pass replaces `v` with `e` in the statement and deletes `v` and
+`hv` from the signature. Every parameter from the first one that mentions `v` onwards moves
+after the colon, into the statement. The proof becomes a function that rebinds those
+parameters in their original form, applied to `e` and `rfl`:
 
 ```lean
 -- before
-theorem stays_open (s : State) (c : Channel) (hc : c = s.channel) (h : Open c) : Final c
--- a caller
-example : Final s.channel := stays_open s s.channel rfl hopen
+theorem queue_drains (state : State) (pending_list : List Op)
+    (pending_is_default : pending_list = default_list state)
+    (schedule : Schedule pending_list) (state_is_valid : Valid state) :
+    Drains pending_list := by
+  <old proof>
 
--- after
-theorem stays_open (s : State) (h : Open s.channel) : Final s.channel
-example : Final s.channel := stays_open s hopen
+-- after this pass (intermediate)
+theorem queue_drains (state : State) :
+    ∀ (schedule : Schedule (default_list state)) (state_is_valid : Valid state),
+      Drains (default_list state) :=
+  (fun (pending_list : List Op) (pending_is_default : pending_list = default_list state)
+       (schedule : Schedule pending_list) (state_is_valid : Valid state) =>
+    show Drains pending_list by
+      <old proof>) (default_list state) rfl
 ```
 
+The old proof is then checked in exactly the local context, and against exactly the goal, in
+which Lean first accepted it. The moved parameters must leave the signature: a parameter that
+stays in the signature remains in the proof's local context as a hidden duplicate, and a tactic
+that collects hypotheses by dependency (for example an induction that generalizes) then sees
+both copies. A theorem's type is the same whether a parameter stands before or after the colon,
+and named arguments still work in both forms (tested on Lean 4.35), so no caller changes.
+
+**Call sites.** At each call to a changed declaration, the pass decides the form from the
+elaborated application, before any check:
+
+1. The caller's value for `v` is definitionally `e`: the pass deletes the arguments for `v`
+   and `hv`.
+2. The caller's value is a local variable that does not occur in `e`, and its equation is a
+   local hypothesis: the call becomes `(by subst hv₀; exact T a h₁ …)`.
+3. Otherwise: an explicit transport, `Eq.ndrec`, with a motive built from the declaration's
+   original type.
+
+Forms 2 and 3 are adapters. When the caller has the same alias in its own signature, the pass
+removes the caller's alias in the same change set, so that the call needs form 1.
+
 **Why the meaning stays the same.** A statement that holds for every `v` equal to `e` holds
-exactly when it holds for `e` itself. In Lean: `(∀ v, v = e → P v) ↔ P e`.
+exactly when it holds for `e` itself. In Lean: `(∀ v, v = e → P v) ↔ P e`. Applying the
+rebinding function to `e` and `rfl` gives the new statement by substitution alone.
 
 **Statements under specification.** When the declaration is an approved specification
 statement, the pass also writes a proof that the new statement is equivalent to the old one,
 has Lean check it, and then deletes the old statement.
 
-### 5.2 `alias-proof`: remove an alias from inside a proof
+### 5.2 `alias-proof`: remove every alias from every proof
 
-**Pattern.** Inside a proof, a tactic introduces a variable together with an equation that
-defines it. The tactics `generalize`, `suffices` and `obtain` can do this. After
-elaboration, all of them leave the same shape in the proof term: a function over the variable
-and its equation, applied to the defining term and to `rfl`.
+**Pattern.** Inside a proof, a variable is tied to a value by an equation that exists only to
+restore another context. The pattern includes every adapter that section 5.1 produces (the
+rebinding function, the `subst` call form, the explicit transport) and every older form in the
+project: `generalize name : value = variable`, a `suffices` that restates a statement with such
+an equation, and `obtain name : variable = value`. After elaboration, all of them leave the same
+shape in the proof term: a function over the variable and its equation, applied to the value
+and to `rfl`, or a transport along such an equation.
 
-**Rewrite.** The pass substitutes the defining term into the proof and deletes the steps that
-used the equation. A proof often introduces such a variable only because an induction needs a
-variable, not a compound term such as `W.length`. In that case, the pass rewrites the
-induction as recursion on the data itself, or as recursion with `termination_by` on the term.
+**Rewrite: replacement, everywhere.** The pass replaces the variable with the value in the
+proof, and removes each use of the equation by the rule for that kind of use. Examples: a
+rewrite with the equation is deleted, because it rewrites nothing. A `clear` or a `subst` of
+the equation is deleted. The variable is dropped from an induction's `generalizing` list. An
+induction whose index was the variable generalizes the value itself at that point, with no
+equation kept. The rule catalogue grows with each kind of use the project contains. After the
+pass, the proof has no alias and no adapter, and reads as if it had been written over the value
+from the start.
+
+**Every instance, without exception.** For every alias, a proof with no alias exists: replace
+the variable with the value and the equation with `rfl` in the proof term, and every transport
+along `rfl` reduces away. Lean's kernel accepts this by substitution and reduction. The only
+open question is how to write that proof back as source, which is engineering, not
+possibility. So a proof that the pass does not rewrite is a defect in the pass (a missing rule),
+reported with the tactic and Lean's error. The run fails. The pass never leaves the instance in
+place.
 
 **Why the meaning stays the same.** Applying a function to an argument and substituting the
-argument into the function's body give the same result (beta reduction). Lean's kernel
-guarantees that this keeps the type of the proof.
+argument into the function's body give the same result (beta reduction). A transport along
+`rfl` reduces to its argument. Lean's kernel guarantees that both keep the type of the proof.
 
 ### 5.3 `variant`: reconcile different premises on one field
 
@@ -318,6 +374,13 @@ The strict gate passes only when the model has no finding at all. The steps ther
 accumulate on one branch. The merge through the project's own process happens once, after the
 last step, when the gate passes. That merge completes the work.
 
+**The gate must see inside proofs.** armada-lean's type-doctrine linter checks statements only.
+Nothing in it inspects a proof body. So a proof that keeps an alias through an adapter (any form
+listed in section 5.2) passes today's gate. Before step 2 is accepted, the linter gains a
+proof-level rule that reports each such form. It works on the elaborated proof term, as the
+statement rule does. With it, "no finding" means "no alias anywhere", which is the goal, and
+an adapter cannot reach the merged result.
+
 Tests on small Lean snippets help the developer of a pass. They run real Lean, with no mock,
 but they do not make a step done. When a developer tests one change on the model, the work list
 holds only the instances that the change must fix.
@@ -326,8 +389,8 @@ holds only the instances that the change must fix.
 
 | Step | Content | Instances on armada-lean `integrated` (`ab5b476`) |
 |---|---|---|
-| 1 | The pass manager: the two-layer IR (Syntax and `Expr`), the dependency graph, change sets of Syntax rewrites, the reprint back end, typed input, the fixpoint, the failure rules of section 7. The alias pass is rewritten onto it, with the rewrite of section 5.1 and no fallback form. | 36 internal findings at armada-lean `9c6ef1b` (the acceptance set) |
-| 2 | `alias-proof` | 10 restated statements and 8 aliases from `generalize` |
+| 1 | The pass manager: the two-layer IR (Syntax and `Expr`), the dependency graph, change sets of Syntax rewrites, the reprint back end, typed input, the fixpoint, the failure rules of section 7. The alias pass of section 5.1: statements, signatures and call sites, with the old proofs carried across by adapters. | 36 internal findings at armada-lean `9c6ef1b` (the acceptance set) |
+| 2 | `alias-proof` (section 5.2): every alias and every adapter removed from every proof, by replacement. The proof-level linter rule of section 9. | Every adapter from step 1, plus 10 restated statements and 8 `generalize` aliases already in the model |
 | 3 | `alias` on specification statements, with the equivalence proofs | 17 findings |
 | 4 | `refine` for one input | 217 hypotheses on one input, and 25 one-variable groups |
 | 5 | Formal concept analysis, and `refine` for several inputs | 197 groups |
@@ -337,6 +400,14 @@ The formal concept analysis is a self-contained algorithm, and its development c
 any time. The other steps share the types of the pass manager, so step 1 defines those types
 first. After that, steps 2, 3, 4 and 6 can be developed at the same time. Runs on the model
 happen in the fixed pass order, because the passes edit the same files.
+
+**Step 1 measures the wrong thing if it rewrites proofs.** Between 2026-11-18 and 2026-11-19,
+the proof-rewriting work that belongs to step 2 was put into step 1, and step 1's acceptance
+counted how many proofs survived it. See `docs/labbook/2026-11-19-alias-transport-and-step-split.md`.
+Step 1 is measured by statements: each finding's alias is gone from the statement and the
+signature, and Lean accepts the change set. Its adapters add lines, so the model's line count
+is not a step-1 criterion. Step 2 is measured by proofs: the proof-level rule reports nothing,
+and the model's line count after step 2 is no higher than before step 1.
 
 **The strict gate of armada-lean waits for the last step.** It fails on any finding, so it
 can merge only when the steps above bring armada-lean to zero findings. Until then, each step
@@ -375,8 +446,11 @@ fallbacks. The design removes each of these defects:
   writes byte-range deletions, inserts the right-hand side as a string, and guesses
   parentheses (`atomic`). Its input is strings (`Finding`, with `at` split on `:`).
 - When the tool cannot rewrite a proof directly, it no longer tries `generalize` instead.
+  The alias pass uses one adapter form per case, decided in advance, and the `alias-proof`
+  pass removes every adapter.
 - When a caller does not fit the changed declaration, it no longer tries a series of casts
-  until one works. The change set rewrites the caller, or the change fails.
+  until one works. The call-site form is decided in advance from the elaborated call, and a
+  caller with the same alias is rewritten in the same change set.
 - It no longer retries failed declarations a fixed second time. It repeats all passes until
   nothing changes.
 - It reads the exit status of the project's gate, and a failed gate fails the run.
