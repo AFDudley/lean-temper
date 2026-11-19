@@ -398,7 +398,7 @@ holds only the instances that the change must fix.
 | 1 | The pass manager: the two-layer IR (Syntax and `Expr`), the dependency graph, change sets of Syntax rewrites, the reprint back end, typed input, the fixpoint, the failure rules of section 7. The alias pass of section 5.1: statements, signatures and call sites, with the old proofs carried across by adapters. | 36 internal findings at armada-lean `9c6ef1b` (the acceptance set) |
 | 2 | `alias-proof` (section 5.2): every alias and every adapter removed from every proof, by replacement. The proof-level linter rule of section 9. | Every adapter from step 1, plus 10 restated statements and 8 `generalize` aliases already in the model |
 | 3 | `alias` on specification statements, with the equivalence proofs | 17 findings |
-| 4 | `refine` for one input | 217 hypotheses on one input, and 25 one-variable groups |
+| 4 | The boundary analysis of section 4: the boundary set, derived from the configuration's `boundaryRoots` (section 8). `refine` for one input (section 5.4), which builds each refined value at a boundary. | 217 hypotheses on one input, and 25 one-variable groups |
 | 5 | Formal concept analysis, and `refine` for several inputs | 197 groups |
 | 6 | `variant` | 9 groups |
 
