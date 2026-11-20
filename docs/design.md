@@ -20,58 +20,15 @@ state-channel protocol. The tool itself knows nothing about armada-lean. A confi
 file supplies the facts of each project.
 
 This document is for a reader who knows Lean 4. It does not assume knowledge of compiler
-design or of proof repair. Section 2 defines the terms that the rest of the document uses.
+design or of proof repair. Section 2 names where the terms are defined.
 
 ## 2. Terms
 
-**Alias.** A variable that gives a second name to a value that other variables already
-determine, together with an equation that records that fact. Example: a theorem takes
-`c : Channel` and `hc : c = s.channel`. The value `c` adds no information, because
-`s.channel` already fixes it.
-
-**Refined type.** A type whose values carry a fact together with their data, so that a
-value without the fact cannot exist. Example: `{o : List Entry // o.Nodup}` holds only lists
-without duplicates. Lean writes such a type as a subtype or as a structure with a `Prop`
-field.
-
-**Boundary.** A declaration where data enters the model: an operation that creates a new
-state, an initial state, or a constructor of a reachable state. A refined value is built at
-a boundary. Everywhere else, statements receive it already built.
-
-**Intermediate representation (IR).** The form of the program that the compiler works on.
-For lean-temper, the IR has two linked layers for each declaration:
-
-- the **Syntax** tree of its source command, as the Lean parser produced it. Each node keeps
-  its source text, and the whitespace and comments around it (`SourceInfo.original`), so
-  `Syntax.reprint` gives back the original text byte for byte;
-- the elaborated **`Expr`** of its type and its value, which the kernel checks.
-
-The info tree links each Syntax node to the `Expr` that Lean elaborated from it. The IR also
-holds the dependency graph: for each declaration, the declarations that its type and its
-value use.
-
-**Pass.** One step of the compiler. A pass finds every instance of one pattern in the IR and
-applies one rewrite to each instance.
-
-**Postcondition.** A property that must hold after a pass. For lean-temper, the
-postcondition of a pass is that its linter reports no finding.
-
-**Change set.** A group of rewrites that the tool keeps or discards as one unit. A rewrite
-replaces a Syntax node of a declaration with a new Syntax node, never a range of bytes. When
-the signature of a declaration changes, the change set holds that declaration and every
-declaration that calls it.
-
-**Transport.** Moving a proof from one type to an equivalent type. If two types are
-equivalent, every proof about one gives a proof about the other. Each lean-temper pass
-replaces a type with an equivalent one, so each existing proof can be moved instead of
-written again.
-
-**Translation validation.** A way to make a compiler trustworthy without proving the
-compiler correct: an independent checker checks each output. For lean-temper, Lean is the
-checker. The tool keeps a change set only if Lean accepts it.
-
-**Fixpoint.** The state in which running the passes again changes nothing. The tool repeats
-its passes until it reaches this state.
+The terms of this document are defined in `glossary.md` at the root of this repository: pass,
+intermediate representation (IR), change set, postcondition, fixpoint, transport, translation
+validation, adapter, finding, linter, proof-level rule, alias, refined type, boundary,
+inventory, specification statement, helper, protected set, weak form, strong form, gate and
+judgment.
 
 ## 3. Principles
 
