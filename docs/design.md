@@ -391,7 +391,63 @@ Tests on small Lean snippets help the developer of a pass. They run real Lean, w
 but they do not make a step done. When a developer tests one change on the model, the work list
 holds only the instances that the change must fix.
 
+### 9.1 The two forms of "done" (operator ruling, 2026-11-20)
+
+A model has two kinds of statement. A **specification statement** says what the system must
+do. In armada-lean it has a record under `ArmadaLean/Spec/`, and `#check_spec_bindings` binds
+its theorem to that record (armada-lean `docs/spec-module-design.md`). A **helper** is every
+other theorem. A helper exists only to prove the specification statements.
+
+**The weak form.** A run is done in the weak form when all four conditions hold:
+
+1. No file under a protected path changes, and `#check_spec_bindings` passes.
+2. The run changes only `theorem` declarations. It changes no `def`, `structure`, `inductive`
+   or `abbrev`. The tool checks this with a diff of declaration kinds.
+3. The whole model builds, and the project's gate runs on the whole model.
+4. The step's linter reports no finding in its scope, the proof-level rule reports no adapter,
+   and the merge meets the GATE above.
+
+Conditions 1 and 2 keep every specification statement and every definition unchanged. So the
+weak form needs no equivalence proof for a specification statement, and no analysis of which
+definitions the specification uses. The rule of section 3 stays in force for every rewrite.
+
+**The strong form.** A run is done in the strong form when one run on the whole model gives
+one verdict:
+
+1. Every specification statement is unchanged, or the run changed it and Lean checked a proof
+   that the old and the new statement are equivalent.
+2. Every definition in the **protected set** is unchanged, or changed with such a proof. The
+   protected set is every definition that a specification statement reaches in the dependency
+   graph.
+3. Every helper builds. The tool may replace a helper's statement with any statement. A helper
+   needs no equivalence proof. This relaxes the rule of section 3 for helpers only.
+4. The linters report nothing, and no adapter remains.
+
+The strong form needs three parts that do not exist yet: the computation of the protected set,
+a configuration mode that accepts a change under a protected path together with its
+equivalence proof, and the acceptance run on the whole model.
+
 ## 10. Build plan
+
+**Roadmap (operator ruling, 2026-11-20).** The work has three phases, in this order:
+
+1. **The weak form** (section 9.1). It covers steps 1 and 2. It covers step 6 if `variant`
+   changes theorems only. All 26 of the alias findings' declarations that a text search
+   resolved are `theorem` declarations; the inventory script must confirm the kind of all 27.
+2. **The strong form** (section 9.1). Its three missing parts come first. Then steps 3, 4 and
+   5 run under it: step 3 changes specification statements, and steps 4 and 5 change state
+   types.
+3. **A second project: `FlashProve/lean`.** The analysis passes run there with a new
+   configuration and no change to the tool's code. The output is a list of candidate types.
+   Known obstacles: the linters are in `ArmadaLean/Lint/` and must move into the tool;
+   `FlashProve/lean` has no `Spec/` convention, so the configuration must take a list of root
+   theorems; `FlashProve/lean` pins Lean v4.29.1 and the tool pins v4.35.0.
+
+The purpose of the tool is wider than the type-doctrine findings. A model in the tool's normal
+form is the input of the generators (Solidity, and the shared application code). The types
+that the analysis passes find are the vocabulary of a declared form for new work. An analysis
+that finds a shared pattern in definition bodies (for example `if h : Pre then some (Effect
+⟨_, h⟩) else none` in `Pool.apply` and `Adjudicator.apply`) is not built and not scheduled.
 
 | Step | Content | Instances on armada-lean `integrated` (`ab5b476`) |
 |---|---|---|
