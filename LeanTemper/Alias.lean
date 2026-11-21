@@ -235,7 +235,7 @@ def Pair.inStatement (p : Pair) : Bool := p.vGroup.isNone || p.hvGroup.isNone
     occurrences of `v` and `hv` in the proof replaced (`v` by `rhs`, a
     rewrite or `subst` with `hv` deleted, another `hv` by `rfl`); and
     `preamble`, the proof text kept behind `generalize`. No form restates the
-    old statement: a copy of it is a deprecated copy (repair pass R.5). -/
+    old statement: a kept copy would duplicate the statement (armada-laconic `docs/process.md` R.5). -/
 structure DeclEdits where
   sig : Array Edit
   proof : Except String (Array Edit)
