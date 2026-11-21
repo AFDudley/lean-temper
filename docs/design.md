@@ -321,7 +321,7 @@ Each project supplies one JSON file. Every key is required. The tool has no defa
 
 A step of the work is done when the tool has run on armada-lean at a pinned commit and the run
 is done in the weak or the strong form of section 9.1. The gates of a merge into armada-lean are
-gates GRa, GRb and GRc of `armada-laconic/docs/process.md` ("The repair pass"): the lean-temper
+gates GRa, GRb and GRc of `armada-laconic/docs/process.md` ("The refactoring pass"): the lean-temper
 run is done in the weak or the strong form, `lake build` passes, and `scripts/check.sh` reports
 no type-doctrine count above `scripts/gate-baseline.json` (`lint_ok`). Where `process.md` and
 this document differ, `process.md` governs (operator ruling, 2026-11-19).
