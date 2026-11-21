@@ -48,10 +48,10 @@ retries a failed change a fixed number of times. It never substitutes a default 
 missing fact.
 
 **The linter decides when a pass is complete.** A pass is complete when its linter reports
-no finding. If a finding remains, the run fails. The project's own gate then checks the
-result independently. A linter can only enforce what it can see, so each pass's linter must
-check the pass's actual goal. A linter that checks statements cannot show that a proof is free
-of aliases. That needs its own rule, which inspects proof bodies (section 9).
+no finding. If a finding remains, the run fails. The project's check command (`checkCommand`)
+then checks the result independently. A linter can only enforce what it can see, so each pass's
+linter must check the pass's actual goal. A linter that checks statements cannot show that a
+proof is free of aliases. That needs its own rule, which inspects proof bodies (section 9).
 
 **A pass covers every instance of its pattern.** A pass rule never says "where it can". If an
 instance of the pattern exists that the pass does not rewrite, that is a defect in the pass:
@@ -102,7 +102,7 @@ A run has four stages.
 4. **The back end** writes the result back to the source files. For each declaration that a
    kept change set touched, it replaces the command's text with the reprint of the changed
    Syntax tree. Then the tool builds the changed modules, runs each pass's linter, and runs
-   the project's gate. The run succeeds only if all of them succeed.
+   the project's check command (`checkCommand`). The run succeeds only if all of them succeed.
 
 ## 5. The passes
 
@@ -301,8 +301,8 @@ The tool reports a failure in three ways, and it never hides one.
 - A missing fact stops the run with an error. Examples: a declaration that the tool cannot
   find in its file, or a configuration key that is absent.
 - The run exits with a failure if the build of the changed modules fails, if any linter still
-  reports a finding, or if the project's gate fails. The tool reads the exit status of each
-  of these commands.
+  reports a finding, or if the project's check command fails. The tool reads the exit status of
+  each of these commands.
 
 ## 8. Configuration
 
@@ -314,35 +314,28 @@ Each project supplies one JSON file. Every key is required. The tool has no defa
 | `protectedPaths` | Paths that the tool never edits. |
 | `boundaryRoots` | The declarations from which the tool derives the boundary set. |
 | `lintCommand` | The commands that build and run the project's linters. |
-| `checkCommand` | The project's gate. |
+| `checkCommand` | The command that runs the project's checks. For armada-lean: `lake build && scripts/check.sh`. |
 | `slots` | The Lean process slots that the tool may use. |
 
 ## 9. Acceptance
 
-A step of the work is done only when the tool has run on the real project and Lean has
-accepted the result. For armada-lean, each step must meet three conditions:
+A step of the work is done when the tool has run on armada-lean at a pinned commit and the run
+is done in the weak or the strong form of section 9.1. The gates of a merge into armada-lean are
+gates GRa, GRb and GRc of `armada-laconic/docs/process.md` ("The repair pass"): the lean-temper
+run is done in the weak or the strong form, `lake build` passes, and `scripts/check.sh` reports
+no type-doctrine count above `scripts/gate-baseline.json` (`lint_ok`). Where `process.md` and
+this document differ, `process.md` governs (operator ruling, 2026-11-19).
 
-1. The tool runs on armada-lean, and Lean accepts every change set that the tool keeps.
-2. The step's linter reports no finding for the instances in its scope.
-3. The project's strict gate (`scripts/check.sh`) fails only on findings outside the step's
-   scope, and no count is higher than before the step.
+The net line change of the model code (`model_net_lines`, from `scripts/check.sh --json --base
+REF`) is a measurement, not a gate. A run that adds lines is examined for a missing deletion or
+an adapter.
 
-**Each merge into armada-lean meets the GATE of `armada-laconic/docs/process.md`.** Operator
-ruling, 2026-11-19: where `process.md` and this document differ, `process.md` governs. Its
-GATE says "Every step merges on its own". At each merge, no type-doctrine count rises
-(`scripts/check.sh`, `lint_ok`), and the net line change of the model code is at most 0. So a
-merge happens only at a point where the result has no adapter. The `alias` pass leaves
-adapters (section 5.1), so its result merges only together with the `alias-proof` result for
-the same findings. In lean-temper, the two passes are separate build steps. On armada-lean,
-they are one merge. The strict gate passes only when the model has no finding at all, so the
-strict gate itself merges after the last step (section 10).
-
-**The gate must see inside proofs.** armada-lean's type-doctrine linter checks statements only.
-Nothing in it inspects a proof body. So a proof that keeps an alias through an adapter (any form
-listed in section 5.2) passes today's gate. Before step 2 is accepted, the linter gains a
-proof-level rule that reports each such form. It works on the elaborated proof term, as the
-statement rule does. With it, "no finding" means "no alias anywhere", which is the goal, and
-an adapter cannot reach the merged result.
+**The proof-level rule.** armada-lean's type-doctrine linter checks statements only. So a proof
+that keeps an alias through an adapter (any form listed in section 5.2) passes `lint_ok` today.
+Step 2 adds a rule to that linter. The rule reads the elaborated proof term and reports each
+such form. With it, "no finding" means "no alias anywhere", and an adapter cannot reach the
+merged result. The rule stays in `ArmadaLean/Lint/` with the other linters until phase 3 of the
+roadmap moves all the linters into the tool (section 10).
 
 Tests on small Lean snippets help the developer of a pass. They run real Lean, with no mock,
 but they do not make a step done. When a developer tests one change on the model, the work list
@@ -360,9 +353,9 @@ other theorem. A helper exists only to prove the specification statements.
 1. No file under a protected path changes, and `#check_spec_bindings` passes.
 2. The run changes only `theorem` declarations. It changes no `def`, `structure`, `inductive`
    or `abbrev`. The tool checks this with a diff of declaration kinds.
-3. The whole model builds, and the project's gate runs on the whole model.
-4. The step's linter reports no finding in its scope, the proof-level rule reports no adapter,
-   and the merge meets the GATE above.
+3. The whole model builds, and the project's check command runs on the whole model.
+4. The step's linter reports no finding in its scope, and the proof-level rule reports no
+   adapter.
 
 Conditions 1 and 2 keep every specification statement and every definition unchanged. So the
 weak form needs no equivalence proof for a specification statement, and no analysis of which
@@ -424,21 +417,22 @@ happen in the fixed pass order, because the passes edit the same files.
 that belongs to step 2 was put into step 1, and step 1's acceptance counted how many proofs
 survived it. See `docs/labbook/2026-11-19-alias-transport-and-step-split.md`. During
 development, step 1 is measured by statements: each finding's alias is gone from the statement
-and the signature, and Lean accepts the change set. Step 1's adapters add lines, so its result
-does not merge alone. Step 2 is measured by proofs: the proof-level rule reports nothing. The
-merge into armada-lean takes the result of both steps for the same findings, and it meets the
-GATE of section 9: no type-doctrine count rises, the net line change of the model code is at
-most 0, and no adapter remains. Steps 3 to 6 each merge on their own, under the same GATE.
+and the signature, and Lean accepts the change set. Step 1 leaves adapters, so its result is not
+done in either form of section 9.1, and it does not merge alone. Step 2 is measured by proofs:
+the proof-level rule reports nothing. The merge into armada-lean takes the result of both steps
+for the same findings. Steps 3 to 6 each merge on their own. Every merge passes the gates of
+section 9.
 
-**The strict gate of armada-lean waits for the last step.** It fails on any finding, so it
+**The strict check of armada-lean waits for the last step.** It fails on any finding, so it
 can merge only when the steps above bring armada-lean to zero findings. Until then, each step
-measures with the current gate (`scripts/check.sh --base`). The port of that gate to Lean is
-parked on armada-lean branch `gate/lean-port` (`f489d01`, worktree `.scratch/gate-lean`). It
-gives the same `--json` and `--base` results as the Python gate at `ab5b476`, apart from the
-intended strict difference. It is not acceptable yet, for four reasons:
+uses the current `scripts/check.sh`, whose `lint_ok` compares the counts with the baseline. The
+port of the checks to a Lean executable (`lake exe armada-gate`) is parked on armada-lean branch
+`gate/lean-port` (`f489d01`, worktree `.scratch/gate-lean`). It gives the same `--json` and
+`--base` results as `scripts/check.sh` at `ab5b476`, apart from the intended strict difference.
+It is not acceptable yet, for four reasons:
 
 - **Speed.** The decision-scope check starts one `lake env lean` process per model file, so the
-  gate takes 12–20 minutes instead of 1–2. The fix is to run the `DecisionScope` linter inside
+  port takes 12–20 minutes instead of 1–2. The fix is to run the `DecisionScope` linter inside
   the normal `lake build`. A command linter runs only in a compile whose import closure holds
   the linter's module, so a package option alone does nothing. Each model module's own compile
   must therefore load `ArmadaLean.Lint.DecisionScope`. An import in the root `ArmadaLean.lean` is
@@ -447,10 +441,10 @@ intended strict difference. It is not acceptable yet, for four reasons:
   Or Lake's `plugins` option can load the compiled linter into each `lean` process, so that its
   `initialize` registers the linter with no edit to a model file (to be verified on Lake 4.35).
   Each compile then records its findings in its `.olean` (`Linter.recordLints`,
-  `Lean/Elab/Frontend.lean:388`). The gate reads them with `Linter.getAllLints` and elaborates
-  nothing again. Elaborating the files again inside the gate's own environment is wrong: that
+  `Lean/Elab/Frontend.lean:388`). The port reads them with `Linter.getAllLints` and elaborates
+  nothing again. Elaborating the files again inside the port's own environment is wrong: that
   environment already holds their declarations. The acceptance limit is that, on a warm tree,
-  the port is no slower than the Python gate.
+  the port is no slower than `scripts/check.sh`.
 - **Scan count.** The port reports 902 scanned files, but the model has 93.
 - **Unverified claims.** The port claims that a large `unsafe def main` links to the wrong
   entry point, and it turned off `enableArtifactCache` for the whole package. Both need a
@@ -474,7 +468,7 @@ fallbacks. The design removes each of these defects:
   caller with the same alias is rewritten in the same change set.
 - It no longer retries failed declarations a fixed second time. It repeats all passes until
   nothing changes.
-- It reads the exit status of the project's gate, and a failed gate fails the run.
+- It reads the exit status of the project's check command, and a failed command fails the run.
 - When it cannot find a declaration in its file, it stops with an error. It no longer checks
   the edit against the start of the file.
 - It checks every changed file through the REPL, and skips none.
