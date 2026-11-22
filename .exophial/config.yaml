@@ -21,6 +21,13 @@ dispatcher:
 #
 # Parity verified (D10): the Dockerfile gate passed on e306eab405ee, and the
 # flake gate passed on this tree with the same command and the same verdict.
+#
+# The same image also carries the Lean REPL, built, at /opt/lean-repl --
+# one of the two things lean-temper's acceptance runs need (README.md "The
+# gate image's acceptance-run paths"). gate.sh itself never reads this path.
+# armada-lean, built, is NOT yet in this image: it waits on armada-lean's
+# own `lake-deps` flake output (branch `nix-images/hooks-and-flake`, not
+# yet merged to armada-lean's `integrated`).
 gate:
   command: [".exophial/gate/gate.sh"]
   timeout: 1800

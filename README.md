@@ -151,6 +151,21 @@ Tests: `lake build tests && .lake/build/bin/tests <target checkout> <repl>`
 (the alias cases elaborate with `Init`; the REPL case runs `<repl>`, the
 Lean REPL, with the checkout's `LEAN_PATH`).
 
+
+## The gate image's acceptance-run paths
+
+The commit-boundary gate image (flake.nix, nix/gate.nix) also carries, at
+fixed paths, one of the two things an acceptance run of this tool needs
+against armada-lean. Neither path is read by `.exophial/gate/gate.sh`
+itself; `gate.sh` still only builds this repository's own two executables.
+A future runner reads these paths; this repository does not yet carry
+that runner.
+
+| Path | Content |
+|------|---------|
+| `/opt/lean-repl` | The Lean REPL (https://github.com/leanprover-community/repl), built at v4.35.0 (nix/repl.nix). `/opt/lean-repl/.lake/build/bin/repl` is the `--repl` binary this tool's own flags want. |
+| `/opt/armada-lean` | Not yet present. Waits on armada-lean's own `lake-deps` flake output (branch `nix-images/hooks-and-flake`, not yet merged to armada-lean's `integrated`). See `.exophial/config.yaml`'s gate comment. |
+
 ## Files
 
 - `Main.lean`: the driver. Steps: the base build and the config's lint
