@@ -6,6 +6,11 @@
     toolsLayer   bashInteractive, coreutils, and the pinned Lean v4.35.0
                  toolchain (lean, lake, leanc, lean4checker) -- no elan (D11):
                  lean-temper's own lean-toolchain names exactly this version
+    fhsLayer     /usr/bin/env: .exophial/gate/gate.sh's own `#!/usr/bin/env
+                 bash` shebang (measured: with no /usr/bin/env, `exec
+                 .exophial/gate/gate.sh` reports "no such file or
+                 directory" -- the missing path is the interpreter, not the
+                 script itself)
     per commit   the judged tree, placed at /gate
 
   .exophial/gate/gate.sh runs only `lake build` then `lake build tests`.
@@ -39,8 +44,16 @@ let
     paths = toolPaths;
     ignoreCollisions = true;
   };
-
   toolsLayer = n2c.buildLayer { copyToRoot = [ toolsEnv ]; };
+
+  fhsRoot = pkgs.runCommand "lean-temper-gate-fhs-root" { } ''
+    mkdir -p $out/usr/bin
+    ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
+  '';
+  fhsLayer = n2c.buildLayer {
+    copyToRoot = [ fhsRoot ];
+    layers = [ toolsLayer ];
+  };
 
   # The judged tree, placed AT /gate: `copyToRoot` merges a listed path's own
   # CONTENTS at the image root, so `gateSrc` itself (a plain checkout
@@ -57,7 +70,10 @@ n2c.buildImage {
   # docker.io/library/<name>, and a short name lets podman resolve it against
   # a remote registry. A localhost/ name never resolves there.
   name = "localhost/lean-temper-gate";
-  layers = [ toolsLayer ];
+  layers = [
+    toolsLayer
+    fhsLayer
+  ];
   copyToRoot = [ gateTree ];
   config = {
     WorkingDir = "/gate";
