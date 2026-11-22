@@ -14,11 +14,17 @@ dispatcher:
 
 # Commit-boundary acceptance gate the integrator re-runs in-worktree for pebbles
 # with NO linked spec (a linked spec is graded in-process by spec_oracle.run_spec).
-# .exophial/gate/gate.sh builds the tool and its tests executable in the Lean gate image
-# (.exophial/gate/Dockerfile).
+# .exophial/gate/gate.sh builds the tool and its tests executable in the gate
+# image: a Nix flake (flake.nix, nix/gate.nix), built from the judged tree,
+# D1-D11, docs/plans/nix-images.md Milestone 3 (T3.x.b). .exophial/gate/Dockerfile
+# stays tracked but unused (the reference the parity check below compares against).
+#
+# Parity verified (D10): the Dockerfile gate passed on e306eab405ee, and the
+# flake gate passed on this tree with the same command and the same verdict.
 gate:
   command: [".exophial/gate/gate.sh"]
   timeout: 1800
+  image: flake
 
 # Where `exophial spec generate` writes unified spec instances (repo-relative).
 spec_dir: "contracts/specs"
