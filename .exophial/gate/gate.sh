@@ -4,9 +4,10 @@
 # with exit 1. It lives under .exophial/gate/ because exophial counts that directory as
 # the judging environment (exophial completion.py, _classify_commit).
 #
-# Scope: the gate builds the tool and its tests executable. It does not run the tests,
-# because the tests need an armada-lean checkout and a built Lean REPL, and the gate image
-# has neither. A test run outside the gate is still required for each change (see README).
+# Scope: the gate builds the tool and its tests executable. It does not run the tests. The gate
+# image carries the Lean REPL at /opt/lean-repl (README.md "The gate image's acceptance-run
+# paths"), but not yet armada-lean: this script reads neither path. A test run against armada-lean,
+# outside the gate, is still required for each change (see README).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/.elan/bin:$PATH"

@@ -31,6 +31,7 @@
       gateSrc = pkgs.lib.cleanSource ./.;
 
       pins = import ./nix/pins.nix { inherit pkgs; };
+      replBuilt = import ./nix/repl.nix { inherit pkgs; lean435 = pins.lean435; };
       exophialGate = import ./nix/gate.nix {
         inherit
           pkgs
@@ -38,6 +39,7 @@
           n2c
           pins
           gateSrc
+          replBuilt
           ;
       };
     in
