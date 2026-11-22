@@ -1,6 +1,6 @@
 # Handoff: lean-temper
 
-Written 2026-11-21 by session `01a1f9a0`.
+Written 2026-11-22 by session `01a1f9a0`.
 
 ## What is to be done
 
@@ -17,11 +17,9 @@ Written 2026-11-21 by session `01a1f9a0`.
 
 ## State
 
-- `integrated` is `43341e14`, on GitHub.
+- `integrated` is on GitHub, and armada-laconic-mono's `lean-temper/` equals it (subtree sync of 2026-11-22).
 - Parked branches: `step1/pass-manager` (worktree `.scratch/step1`) and `concepts/fca` (worktree `.scratch/concepts`,
   222 of 222 `repeatedPremise` groups matched, `1b9e31a`).
 - The last full run of the old alias pass: `.scratch/verify/report-run1.json`.
 - `.scratch/filing/` and the other files in `.exophial/cache/dry-run/` came from a session that wrote them without
   agreement. Nothing depends on them, and they can be deleted.
-- The copy of this repository in armada-laconic-mono is 12 commits behind, because that repository's subtree sync
-  refuses `lean-temper/` (its handoff, item 1).
